@@ -23,6 +23,25 @@ git clone https://github.com/PavelSlaven/team-process.git ~/.claude/skills/team-
 
 Навык становится доступен во всех проектах. Общие правила владельца, на которые он опирается, — в `~/.claude/CLAUDE.md`.
 
+## Версия для Codex
+
+`codex/` — тот же процесс для интерактивной сессии Codex, где Codex — ведущий-ревьюер: инструменты Codex (`spawn_agent`, `followup_task`, `wait_agent`) вместо механизмов Claude Code, общие правила владельца — в `codex/SKILL.md` §0 (Codex не читает `~/.claude/CLAUDE.md`).
+
+- `codex/SKILL.md`, `codex/references/fleet.md`, `codex/references/lessons.md` — переложены под Codex.
+- `codex/references/{executor-rules,briefs,checks,bench}.md` — побайтовые копии корневых файлов.
+
+Установка — копией (папка Codex не git-клон). Резервная копия — в `~/.codex/`, а не в `~/.codex/skills/`: папка с `SKILL.md` внутри `skills/` стала бы вторым навыком `team-process`.
+
+```bash
+mv ~/.codex/skills/team-process ~/.codex/team-process.bak-$(date +%Y%m%d) && cp -r ~/.claude/skills/team-process/codex ~/.codex/skills/team-process
+```
+
 ## Обновление
 
-Правка навыка — сразу коммит и push в этом репозитории. На другой машине — `git -C ~/.claude/skills/team-process pull`. Резервные копии `*.bak-*` в репозиторий не попадают.
+Правка навыка — сразу коммит и push в этом репозитории. Правило меняется в обеих версиях одним коммитом; копии сверяет команда (пустой вывод — совпадают):
+
+```bash
+cd ~/.claude/skills/team-process && for f in executor-rules briefs checks bench; do cmp -s $f.md codex/references/$f.md || echo "differs: $f.md"; done
+```
+
+После правки `codex/` — повторить установку. На другой машине — `git -C ~/.claude/skills/team-process pull`. Резервные копии `*.bak-*` в репозиторий не попадают.
