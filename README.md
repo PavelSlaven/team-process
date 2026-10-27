@@ -9,6 +9,7 @@
 - `checks.md` — детерминированные проверки сдачи.
 - `bench.md` — стенды для решений, зависящих от поведения модели.
 - `briefs.md` — каталог ловушек заданий.
+- `executor-rules.md` — правила для исполнителей, которые включаются в задание.
 - `lessons.md` — уроки.
 - `tools/check-subagent-input.mjs` — проверка фактического входа субагента Workflow; тест: `node --test tools/check-subagent-input.test.mjs`.
 
