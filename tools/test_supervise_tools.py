@@ -103,8 +103,12 @@ class CodexWatchTest(unittest.TestCase):
     def test_helper_without_records_in_window_skipped(self):
         write_log(os.path.join(self.sessions, 'rollout-2026-10-28T10-05-00-019fffff-done.jsonl'),
                   [cmd_rec(200, 'long ago')], first={'timestamp': stamp(250), 'type': 'session_meta',
-                  'payload': {'parent_thread_id': LEAD_ID, 'agent_nickname': 'Hypatia'}})
-        self.assertNotIn('Hypatia', self.watch())
+                  'payload': {'parent_thread_id': LEAD_ID, 'agent_nickname': 'Hypatia',
+                              'agent_path': '/root/pair/tester'}})
+        out = self.watch()
+        self.assertNotIn('[Hypatia]', out)
+        self.assertIn('silent helpers', out)
+        self.assertIn('Hypatia /root/pair/tester last ', out)
 
     def test_file_change_in_timeline(self):
         rec = {'timestamp': stamp(2), 'type': 'event_msg', 'payload': {'type': 'item_completed', 'item': {

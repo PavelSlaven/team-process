@@ -95,9 +95,12 @@ def main():
                     or f'"session_id":"{a.thread}"' in head_of(f))]
 
     print(f'window {since:%H:%M}-{now:%H:%M} UTC')
+    silent = []
     for f in lead_files + helpers:
         r = scan(f, since)
         if not r['last'] or r['last'] < since:
+            m = re.search(r'"agent_path":"([^"]*)"', head_of(f))
+            silent.append((r['last'], r['name'], m.group(1) if m else ''))
             continue
         if a.out:
             os.makedirs(a.out, exist_ok=True)
@@ -114,6 +117,11 @@ def main():
             print(f'  fail {f_[0]} exit {f_[1]}: {f_[2]}')
         for m in r['msgs'][-2:]:
             print(f'  says {m[0]}: {m[1]}')
+
+    if silent:
+        print('\nsilent helpers (no records in window):')
+        for last, name, path in sorted(silent, key=lambda x: x[0] or since, reverse=True):
+            print(f"  {name} {path} last {last:%H:%M:%S}" if last else f'  {name} {path} no records')
 
     if not a.worktree:
         return
