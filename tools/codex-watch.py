@@ -38,7 +38,7 @@ def scan(path, since):
         if 'timestamp' not in d:
             continue
         t = parse_ts(d)
-        last = t
+        last = max(last or t, t)
         if t < since:
             continue
         p = d.get('payload') or {}
@@ -80,8 +80,10 @@ def main():
 
     now = dt.datetime.now(dt.timezone.utc)
     since = now - dt.timedelta(minutes=a.minutes)
+    # NTFS does not refresh the modified time of a file that stays open for writing,
+    # so a live rollout can look hours old; the window is checked on its records instead.
     files = [f for f in glob.glob(os.path.join(a.sessions, '**', '*.jsonl'), recursive=True)
-             if dt.datetime.fromtimestamp(os.path.getmtime(f), dt.timezone.utc) >= since]
+             if dt.datetime.fromtimestamp(os.path.getmtime(f), dt.timezone.utc) >= since - dt.timedelta(days=2)]
     lead_files = [f for f in files if a.thread in os.path.basename(f)]
     helpers = [f for f in files if a.thread not in os.path.basename(f)
                and (f'"parent_thread_id":"{a.thread}"' in head_of(f)
@@ -90,6 +92,8 @@ def main():
     print(f'window {since:%H:%M}-{now:%H:%M} UTC')
     for f in lead_files + helpers:
         r = scan(f, since)
+        if not r['last'] or r['last'] < since:
+            continue
         if a.out:
             os.makedirs(a.out, exist_ok=True)
             with open(os.path.join(a.out, r['name'] + '.txt'), 'w', encoding='utf-8') as fh:

@@ -92,6 +92,20 @@ class CodexWatchTest(unittest.TestCase):
                               'agent_nickname': 'Banach'}})
         self.assertIn('[Banach]', self.watch())
 
+    def test_live_helper_with_stale_mtime_found(self):
+        path = os.path.join(self.sessions, 'rollout-2026-10-28T10-04-00-019eeeee-open.jsonl')
+        write_log(path, [cmd_rec(2, 'still writing')], first={'timestamp': stamp(250), 'type': 'session_meta',
+                  'payload': {'session_id': LEAD_ID, 'parent_thread_id': LEAD_ID, 'agent_nickname': 'Noether'}})
+        old = (dt.datetime.now() - dt.timedelta(hours=3)).timestamp()
+        os.utime(path, (old, old))
+        self.assertIn('[Noether]', self.watch())
+
+    def test_helper_without_records_in_window_skipped(self):
+        write_log(os.path.join(self.sessions, 'rollout-2026-10-28T10-05-00-019fffff-done.jsonl'),
+                  [cmd_rec(200, 'long ago')], first={'timestamp': stamp(250), 'type': 'session_meta',
+                  'payload': {'parent_thread_id': LEAD_ID, 'agent_nickname': 'Hypatia'}})
+        self.assertNotIn('Hypatia', self.watch())
+
     def test_repeat_and_fail_lines(self):
         out = self.watch()
         self.assertIn('REPEAT x5 (identical): npm test', out)
