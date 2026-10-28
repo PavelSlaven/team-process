@@ -84,6 +84,14 @@ class CodexWatchTest(unittest.TestCase):
         self.assertIn('[LEAD]', out)
         self.assertNotIn('Stranger', out)
 
+    def test_nested_helper_found_by_root_session_id(self):
+        write_log(os.path.join(self.sessions, 'rollout-2026-10-28T10-03-00-019ddddd-grandchild.jsonl'), [
+            cmd_rec(2, 'pair test'),
+        ], first={'timestamp': stamp(250), 'type': 'session_meta',
+                  'payload': {'session_id': LEAD_ID, 'parent_thread_id': '019bbbbb-helper',
+                              'agent_nickname': 'Banach'}})
+        self.assertIn('[Banach]', self.watch())
+
     def test_repeat_and_fail_lines(self):
         out = self.watch()
         self.assertIn('REPEAT x5 (identical): npm test', out)

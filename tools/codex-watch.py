@@ -84,7 +84,8 @@ def main():
              if dt.datetime.fromtimestamp(os.path.getmtime(f), dt.timezone.utc) >= since]
     lead_files = [f for f in files if a.thread in os.path.basename(f)]
     helpers = [f for f in files if a.thread not in os.path.basename(f)
-               and f'"parent_thread_id":"{a.thread}"' in head_of(f)]
+               and (f'"parent_thread_id":"{a.thread}"' in head_of(f)
+                    or f'"session_id":"{a.thread}"' in head_of(f))]
 
     print(f'window {since:%H:%M}-{now:%H:%M} UTC')
     for f in lead_files + helpers:
