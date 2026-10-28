@@ -106,6 +106,18 @@ class CodexWatchTest(unittest.TestCase):
                   'payload': {'parent_thread_id': LEAD_ID, 'agent_nickname': 'Hypatia'}})
         self.assertNotIn('Hypatia', self.watch())
 
+    def test_file_change_in_timeline(self):
+        rec = {'timestamp': stamp(2), 'type': 'event_msg', 'payload': {'type': 'item_completed', 'item': {
+            'type': 'FileChange', 'changes': {r'C:\wt\tools\check.py': {
+                'type': 'update', 'unified_diff': '@@ -1 +1 @@\n-    pass\n+    return 1'}}}}}
+        write_log(os.path.join(self.sessions, 'rollout-2026-10-28T10-06-00-019abcde-editor.jsonl'), [rec],
+                  first={'timestamp': stamp(250), 'type': 'session_meta',
+                         'payload': {'session_id': LEAD_ID, 'agent_nickname': 'Hopper'}})
+        out = self.watch('--out', self.out)
+        self.assertIn('edits 1;', out.split('[Hopper]')[1])
+        with open(os.path.join(self.out, 'Hopper.txt'), encoding='utf-8') as fh:
+            self.assertIn('EDIT update check.py:', fh.read())
+
     def test_repeat_and_fail_lines(self):
         out = self.watch()
         self.assertIn('REPEAT x5 (identical): npm test', out)

@@ -29,7 +29,7 @@ def scan(path, since):
     m = re.search(r'"agent_nickname":"([^"]*)"', head_of(path))
     name = m.group(1) if m else 'LEAD'
     cmds, fails, compactions, msgs, last = collections.Counter(), [], 0, [], None
-    spawns, timeline = 0, []
+    spawns, edits, timeline = 0, 0, []
     for line in open(path, encoding='utf-8', errors='replace'):
         try:
             d = json.loads(line)
@@ -55,6 +55,11 @@ def scan(path, since):
                 timeline.append(f"{hm} CMD exit {it.get('exit_code')}: {c[:600]}\n    OUT: {outp[:400]}")
                 if str(it.get('exit_code')) not in ('0', 'None'):
                     fails.append((t.strftime('%H:%M'), it.get('exit_code'), c[:100]))
+            if it.get('type') == 'FileChange':
+                for path, ch in (it.get('changes') or {}).items():
+                    edits += 1
+                    diff = str(ch.get('unified_diff') or '')
+                    timeline.append(f"{hm} EDIT {ch.get('type')} {os.path.basename(path)}:\n    {diff[:800]}")
             if it.get('type') == 'CollabAgentToolCall':
                 spawns += 1
         if p.get('type') == 'message' and p.get('role') == 'assistant':
@@ -65,7 +70,7 @@ def scan(path, since):
             text = ' '.join(c.get('text', '') for c in p.get('content') or [] if isinstance(c, dict))
             timeline.append(f"{hm} MSG {p.get('author')} -> {p.get('recipient')}: {text[:2500]}")
     return dict(name=name, path=os.path.basename(path), last=last, cmds=cmds, fails=fails,
-                compactions=compactions, msgs=msgs, spawns=spawns, timeline=timeline)
+                compactions=compactions, msgs=msgs, spawns=spawns, edits=edits, timeline=timeline)
 
 
 def main():
@@ -101,7 +106,7 @@ def main():
         idle = int((now - r['last']).total_seconds() // 60) if r['last'] else None
         total = sum(r['cmds'].values())
         print(f"\n[{r['name']}] idle {idle} min; commands {total}; failed {len(r['fails'])}; "
-              f"compactions {r['compactions']}; collab calls {r['spawns']}")
+              f"compactions {r['compactions']}; edits {r['edits']}; collab calls {r['spawns']}")
         for c, n in r['cmds'].most_common(3):
             if n >= 3:
                 print(f'  REPEAT x{n} (identical): {c[:160]}')
