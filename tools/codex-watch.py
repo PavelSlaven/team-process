@@ -29,7 +29,7 @@ def scan(path, since):
     m = re.search(r'"agent_nickname":"([^"]*)"', head_of(path))
     name = m.group(1) if m else 'LEAD'
     cmds, fails, compactions, msgs, last = collections.Counter(), [], 0, [], None
-    spawns, edits, timeline = 0, 0, []
+    spawns, edits, timeline, progress = 0, 0, [], None
     for line in open(path, encoding='utf-8', errors='replace'):
         try:
             d = json.loads(line)
@@ -39,9 +39,14 @@ def scan(path, since):
             continue
         t = parse_ts(d)
         last = max(last or t, t)
+        p = d.get('payload') or {}
+        if p.get('type') == 'message' and p.get('role') == 'assistant':
+            text = ' '.join(c.get('text', '') for c in p.get('content') or [] if isinstance(c, dict))
+            # The lead writes its step list only when a step changes, often before the window.
+            if 'ХОД:' in text:
+                progress = (t, re.sub(r'\s+', ' ', text[text.index('ХОД:'):])[:1500])
         if t < since:
             continue
-        p = d.get('payload') or {}
         hm = t.strftime('%H:%M:%S')
         if d['type'] == 'compacted':
             compactions += 1
@@ -70,7 +75,8 @@ def scan(path, since):
             text = ' '.join(c.get('text', '') for c in p.get('content') or [] if isinstance(c, dict))
             timeline.append(f"{hm} MSG {p.get('author')} -> {p.get('recipient')}: {text[:2500]}")
     return dict(name=name, path=os.path.basename(path), last=last, cmds=cmds, fails=fails,
-                compactions=compactions, msgs=msgs, spawns=spawns, edits=edits, timeline=timeline)
+                compactions=compactions, msgs=msgs, spawns=spawns, edits=edits, timeline=timeline,
+                progress=progress)
 
 
 def main():
@@ -105,7 +111,10 @@ def main():
         if a.out:
             os.makedirs(a.out, exist_ok=True)
             with open(os.path.join(a.out, r['name'] + '.txt'), 'w', encoding='utf-8') as fh:
-                fh.write(f"{r['name']} {r['path']}\n" + '\n'.join(r['timeline']) + '\n')
+                head = f"{r['name']} {r['path']}\n"
+                if r['progress']:
+                    head += f"{r['progress'][0]:%H:%M:%S} LAST {r['progress'][1]}\n"
+                fh.write(head + '\n'.join(r['timeline']) + '\n')
         idle = int((now - r['last']).total_seconds() // 60) if r['last'] else None
         total = sum(r['cmds'].values())
         print(f"\n[{r['name']}] idle {idle} min; commands {total}; failed {len(r['fails'])}; "
@@ -115,6 +124,8 @@ def main():
                 print(f'  REPEAT x{n} (identical): {c[:160]}')
         for f_ in r['fails'][-3:]:
             print(f'  fail {f_[0]} exit {f_[1]}: {f_[2]}')
+        if r['progress']:
+            print(f"  ход {r['progress'][0]:%H:%M}: {r['progress'][1][:600]}")
         for m in r['msgs'][-2:]:
             print(f'  says {m[0]}: {m[1]}')
 

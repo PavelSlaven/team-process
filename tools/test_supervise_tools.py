@@ -143,6 +143,20 @@ class CodexWatchTest(unittest.TestCase):
         self.assertIn('MSG /root/x -> /root: report to lead', helper)
         self.assertNotIn('too old command', helper)
 
+    def test_last_progress_line_kept_from_before_window(self):
+        write_log(os.path.join(self.sessions, f'rollout-2026-10-28T10-00-00-{LEAD_ID}.jsonl'), [
+            says_rec(200, 'Готово. ХОД: [x] A1 — данные; [>] B1 — работа'),
+            says_rec(150, 'ХОД: [x] A1 — данные; [x] B1 — работа; [>] C — запись'),
+            cmd_rec(2, 'npm test'),
+        ])
+        out = self.watch('--out', self.out)
+        lead = out.split('[LEAD]')[-1]
+        self.assertIn('ход ', lead)
+        self.assertIn('[>] C — запись', lead)
+        self.assertNotIn('[>] B1 — работа', lead)
+        with open(os.path.join(self.out, 'LEAD.txt'), encoding='utf-8') as fh:
+            self.assertIn('LAST ХОД: [x] A1 — данные; [x] B1 — работа; [>] C — запись', fh.read())
+
     def test_no_out_no_files(self):
         self.watch()
         self.assertFalse(os.path.exists(self.out))
