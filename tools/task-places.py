@@ -5,6 +5,7 @@ remove PATH... --refs P... --archive DIR    archive unsaved git state, then dele
 """
 import argparse
 import datetime as dt
+import functools
 import os
 import shutil
 import stat
@@ -12,7 +13,8 @@ import subprocess
 import sys
 import tarfile
 
-COLUMNS = ['path', 'kind', 'size', 'dirty', 'untracked', 'unpushed', 'worktrees', 'procs', 'refs']
+COLUMNS = ['path', 'kind', 'branch', 'head_date', 'size', 'dirty', 'untracked', 'unpushed', 'worktrees',
+           'procs', 'refs']
 UNTRACKED_LIMIT = 100 * 1024 * 1024
 TEXT_LIMIT = 2 * 1024 * 1024
 
@@ -38,11 +40,19 @@ def kind_of(path):
 
 
 def size_of(path):
-    total = 0
-    for top, dirs, files in os.walk(path):
-        for f in files:
+    # scandir entries carry the directory listing's stat on Windows, so no file is opened.
+    total, stack = 0, [path]
+    while stack:
+        try:
+            entries = list(os.scandir(stack.pop()))
+        except OSError:
+            continue
+        for e in entries:
             try:
-                total += os.lstat(os.path.join(top, f)).st_size
+                if e.is_dir(follow_symlinks=False):
+                    stack.append(e.path)
+                else:
+                    total += e.stat(follow_symlinks=False).st_size
             except OSError:
                 pass
     return total
@@ -65,9 +75,10 @@ def needles(path):
     p = norm(path)
     parts = p.rstrip('/').split('/')
     out = {p, '/'.join(parts[-2:])}
-    # Short names like "repo" or "tmp" occur everywhere; only longer folder names are searched alone.
-    if len(parts[-1]) >= 8:
-        out.add(parts[-1])
+    # Names like "repo" or "Novgorod" occur everywhere; only long names with a digit or separator are searched alone.
+    name = parts[-1]
+    if len(name) >= 8 and not name.isalpha():
+        out.add(name)
     return out
 
 
@@ -82,12 +93,10 @@ def ref_files(refs):
                 yield os.path.join(top, f)
 
 
-def refs_to(path, refs):
-    found, own = [], norm(path) + '/'
-    keys = needles(path)
+@functools.lru_cache(maxsize=None)
+def ref_texts(refs):
+    texts = []
     for f in ref_files(refs):
-        if norm(f).startswith(own):
-            continue
         try:
             if os.path.getsize(f) > TEXT_LIMIT:
                 continue
@@ -99,6 +108,16 @@ def refs_to(path, refs):
         text = data.decode('utf-8', 'replace').replace('\\\\', '/').replace('\\', '/')
         if os.name == 'nt':
             text = text.lower()
+        texts.append((f, norm(f), text))
+    return texts
+
+
+def refs_to(path, refs):
+    found, own = [], norm(path) + '/'
+    keys = needles(path)
+    for f, nf, text in ref_texts(tuple(refs)):
+        if nf.startswith(own) or not any(k in text for k in keys):
+            continue
         for i, line in enumerate(text.splitlines(), 1):
             if any(k in line for k in keys):
                 found.append(f'{f}:{i}')
@@ -122,6 +141,8 @@ def describe(path, refs, with_size):
         row['dirty'] = str(len(lines) - int(row['untracked']))
         rc, count = git(path, 'rev-list', '--count', 'HEAD', '--not', '--remotes')
         row['unpushed'] = count.strip() if rc == 0 else '0'
+        row['branch'] = git(path, 'branch', '--show-current')[1].strip() or 'detached'
+        row['head_date'] = git(path, 'log', '-1', '--format=%cs')[1].strip() or '-'
         if row['kind'] == 'repo':
             _, wl = git(path, 'worktree', 'list', '--porcelain')
             row['worktrees'] = str(max(0, wl.count('worktree ') - 1))

@@ -68,6 +68,8 @@ class TaskPlaces(unittest.TestCase):
         wt = r[self.norm(self.wt)]
         self.assertEqual((wt['kind'], wt['dirty'], wt['untracked'], wt['unpushed']),
                          ('worktree', '1', '1', '1'))
+        self.assertEqual(wt['branch'], 'task-7')
+        self.assertRegex(wt['head_date'], r'^\d{4}-\d{2}-\d{2}$')
         self.assertEqual(r[self.norm(self.main)]['kind'], 'repo')
         self.assertEqual(r[self.norm(self.main)]['worktrees'], '1')
 
@@ -86,6 +88,13 @@ class TaskPlaces(unittest.TestCase):
         row = next(iter(rows(out).values()))
         self.assertEqual(row['kind'], 'missing')
         self.assertIn('goal.md:1', row['refs'])
+
+    def test_plain_word_folder_name_alone_is_not_a_reference(self):
+        with open(os.path.join(self.refs, 'notes.md'), 'w', encoding='utf-8') as fh:
+            fh.write('the Novgorod repository\n')
+        rc, out, err = run('inventory', '/srv/work/task-9/Novgorod', '--refs', self.refs)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(next(iter(rows(out).values()))['refs'], '0')
 
     def test_remove_archives_changes_then_removes_worktree(self):
         rc, out, err = run('remove', self.wt, '--refs', self.refs, '--archive', self.archive)
