@@ -88,6 +88,10 @@ def ref_files(refs):
             yield r
             continue
         for top, dirs, files in os.walk(r):
+            # A clone made with --shared or --reference reads its objects through this file inside the skipped .git.
+            alt = os.path.join(top, '.git', 'objects', 'info', 'alternates')
+            if os.path.isfile(alt):
+                yield alt
             dirs[:] = [d for d in dirs if d != '.git']
             for f in files:
                 yield os.path.join(top, f)
@@ -125,6 +129,12 @@ def refs_to(path, refs):
     return found
 
 
+def with_alternates(refs, paths):
+    # A clone removed in the same run still needs its lender's objects to archive its own history.
+    alts = (os.path.join(p, '.git', 'objects', 'info', 'alternates') for p in paths)
+    return tuple(refs) + tuple(f for f in alts if os.path.isfile(f))
+
+
 def describe(path, refs, with_size):
     row = dict.fromkeys(COLUMNS, '-')
     row['path'], row['kind'] = norm(path), kind_of(path)
@@ -135,12 +145,12 @@ def describe(path, refs, with_size):
     if with_size:
         row['size'] = str(size_of(path))
     if row['kind'] in ('worktree', 'repo'):
-        _, status = git(path, 'status', '--porcelain', '--untracked-files=all')
+        rc, status = git(path, 'status', '--porcelain', '--untracked-files=all')
         lines = status.splitlines()
-        row['untracked'] = str(sum(ln.startswith('??') for ln in lines))
-        row['dirty'] = str(len(lines) - int(row['untracked']))
+        row['untracked'] = str(sum(ln.startswith('??') for ln in lines)) if rc == 0 else '?'
+        row['dirty'] = str(len(lines) - int(row['untracked'])) if rc == 0 else '?'
         rc, count = git(path, 'rev-list', '--count', 'HEAD', '--not', '--remotes')
-        row['unpushed'] = count.strip() if rc == 0 else '0'
+        row['unpushed'] = count.strip() if rc == 0 else '?'
         row['branch'] = git(path, 'branch', '--show-current')[1].strip() or 'detached'
         row['head_date'] = git(path, 'log', '-1', '--format=%cs')[1].strip() or '-'
         if row['kind'] == 'repo':
@@ -162,6 +172,8 @@ def refusal(path, row, found):
         return f"{row['procs']} processes have their working directory inside"
     if found:
         return 'referenced by ' + ', '.join(found)
+    if '?' in (row['dirty'], row['unpushed']):
+        return 'git cannot read its history or working tree, so its unsaved work cannot be archived'
     if row['kind'] in ('worktree', 'repo') and not git(path, 'remote')[1].strip():
         return 'no remote, so the unpushed history has no bound'
     if row['untracked'] not in ('-', '0'):
@@ -230,17 +242,20 @@ def main():
     ap.add_argument('--dry-run', action='store_true')
     a = ap.parse_args()
     sys.stdout.reconfigure(encoding='utf-8')
+    refs = with_alternates(a.refs, a.paths)
     if a.mode == 'inventory':
         print('\t'.join(COLUMNS))
         for p in a.paths:
-            print('\t'.join(describe(p, a.refs, a.size)[0][c] for c in COLUMNS))
+            print('\t'.join(describe(p, refs, a.size)[0][c] for c in COLUMNS))
         return 0
     if not a.refs or not a.archive:
         print('remove needs --refs and --archive', file=sys.stderr)
         return 2
+    # git bundle runs inside the place with -C, where a relative archive path points elsewhere.
+    a.archive = os.path.abspath(a.archive)
     plan = []
     for p in a.paths:
-        row, found = describe(p, a.refs, False)
+        row, found = describe(p, refs, False)
         why = refusal(p, row, found)
         if why:
             print(f'refused {row["path"]}: {why}', file=sys.stderr)

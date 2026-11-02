@@ -1,4 +1,5 @@
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -9,9 +10,9 @@ TOOLS = os.path.dirname(os.path.abspath(__file__))
 PLACES = os.path.join(TOOLS, 'task-places.py')
 
 
-def run(*args):
+def run(*args, cwd=None):
     p = subprocess.run([sys.executable, '-I', PLACES, *args], capture_output=True, encoding='utf-8',
-                       stdin=subprocess.DEVNULL)
+                       stdin=subprocess.DEVNULL, cwd=cwd)
     return p.returncode, p.stdout, p.stderr
 
 
@@ -111,6 +112,51 @@ class TaskPlaces(unittest.TestCase):
         git(self.main, 'bundle', 'verify', bundle)
         with open(os.path.join(self.archive, 'remove.log'), encoding='utf-8') as fh:
             self.assertIn('removed', fh.read())
+
+    def test_remove_with_relative_archive_keeps_bundle(self):
+        rc, out, err = run('remove', self.wt, '--refs', self.refs, '--archive', 'archive', cwd=self.tmp.name)
+        self.assertEqual(rc, 0, err)
+        names = os.listdir(self.archive)
+        self.assertTrue(any(n.endswith('.bundle') for n in names), names)
+
+    def shared_clone(self, parent):
+        lender = os.path.join(self.tmp.name, 'lender')
+        dep = os.path.join(parent, 'dep')
+        subprocess.run(['git', 'clone', '-q', '-b', 'main', self.origin, lender], check=True, capture_output=True,
+                       stdin=subprocess.DEVNULL)
+        git(lender, 'commit', '-q', '--allow-empty', '-m', 'lender only')
+        subprocess.run(['git', 'clone', '-q', '--shared', lender, dep], check=True, capture_output=True,
+                       stdin=subprocess.DEVNULL)
+        with open(os.path.join(dep, 'c.txt'), 'w') as fh:
+            fh.write('dep\n')
+        git(dep, 'add', 'c.txt')
+        git(dep, 'commit', '-q', '-m', 'dep')
+        # The remote ref stops below the lender's commit, so counting unpushed commits must read the lender.
+        git(dep, 'update-ref', 'refs/remotes/origin/main', 'HEAD~2')
+        return lender, dep
+
+    def test_remove_refuses_repo_lending_objects_to_a_live_clone(self):
+        lender, dep = self.shared_clone(self.refs)
+        rc, out, err = run('remove', lender, '--refs', self.refs, '--archive', self.archive)
+        self.assertNotEqual(rc, 0)
+        self.assertIn('alternates', err)
+        self.assertTrue(os.path.isdir(os.path.join(lender, '.git')))
+
+    def test_remove_refuses_lender_removed_with_its_clone(self):
+        lender, dep = self.shared_clone(os.path.join(self.tmp.name, 'task-7'))
+        rc, out, err = run('remove', lender, dep, '--refs', self.refs, '--archive', self.archive)
+        self.assertNotEqual(rc, 0)
+        self.assertIn('alternates', err)
+        self.assertTrue(os.path.isdir(os.path.join(lender, '.git')))
+        self.assertTrue(os.path.isdir(dep))
+
+    def test_remove_refuses_repo_whose_history_cannot_be_read(self):
+        lender, dep = self.shared_clone(os.path.join(self.tmp.name, 'task-7'))
+        shutil.rmtree(lender, onerror=lambda f, p, _: (os.chmod(p, stat.S_IWRITE), f(p)))
+        rc, out, err = run('remove', dep, '--refs', self.refs, '--archive', self.archive)
+        self.assertNotEqual(rc, 0)
+        self.assertIn('cannot read', err)
+        self.assertTrue(os.path.isdir(dep))
 
     def test_remove_refuses_referenced_place(self):
         with open(os.path.join(self.refs, 'goal.md'), 'w', encoding='utf-8') as fh:
