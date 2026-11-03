@@ -11,6 +11,8 @@ JS_SIMPLE_ESCAPES = {'n': '\n', 't': '\t', 'r': '\r', '0': '\0'}
 EXEC_SPLIT = re.compile(r'(?=\bexec_command\b)')
 TRUNCATED_OUTPUT = re.compile(r'^Warning: truncated output \(original token count: \d+\)', re.M)
 ABSOLUTE_PATH = re.compile(r'^(?:/|[a-z]:/)')
+SED_RANGE = re.compile(r'^(\d+|\$)(?:,(\d+|\$))?p$')
+LAST_LINE = sys.maxsize
 
 
 def literal_pattern(key):
@@ -181,12 +183,43 @@ def chain_parts(command, directory):
             current = []
 
 
-def cat_arguments(command, directory):
+def visible_parts(command, directory):
     for words, operator, part_directory in chain_parts(command, directory):
         hides_output = (operator[0] == '|' and operator[:2] != '||') or operator in ('>', '>>', '&>', '&>>')
-        if words[:1] == ['cat'] and not hides_output:
+        if not hides_output:
+            yield words, part_directory
+
+
+def cat_arguments(command, directory):
+    for words, part_directory in visible_parts(command, directory):
+        if words[:1] == ['cat']:
             for word in words[1:]:
                 yield word, part_directory
+
+
+def sed_ranges(script):
+    ranges = []
+    for piece in script.split(';'):
+        piece = piece.strip()
+        if not piece:
+            continue
+        match = SED_RANGE.match(piece)
+        if not match:
+            return []
+        start = LAST_LINE if match.group(1) == '$' else int(match.group(1))
+        end = start if match.group(2) is None else LAST_LINE if match.group(2) == '$' else int(match.group(2))
+        if start < 1:
+            return []
+        ranges.append((start, max(start, end)))
+    return ranges
+
+
+def sed_slices(command, directory):
+    for words, part_directory in visible_parts(command, directory):
+        if len(words) == 4 and words[:2] == ['sed', '-n']:
+            ranges = sed_ranges(words[2])
+            if ranges:
+                yield words[3], part_directory, ranges
 
 
 def command_directories(command, directory):
@@ -200,6 +233,43 @@ def note_cat(command, directory, wanted):
     return found
 
 
+def note_sed(command, directory, wanted):
+    found = {}
+    for argument, part_directory, ranges in sed_slices(command, directory):
+        for target in candidates(argument, part_directory) & wanted:
+            found.setdefault(target, []).extend(ranges)
+    return found
+
+
+def line_count(path):
+    try:
+        with open(path, 'rb') as fh:
+            data = fh.read()
+    except OSError:
+        return 0
+    return data.count(b'\n') + (1 if data and not data.endswith(b'\n') else 0)
+
+
+def covers_file(ranges, total):
+    reached = 0
+    for start, end in sorted(ranges):
+        if start > reached + 1:
+            break
+        reached = max(reached, min(end, total))
+    return total > 0 and reached >= total
+
+
+def sed_covered(slices, truncated, requested):
+    covered = set()
+    for target, by_key in slices.items():
+        total = line_count(requested[target])
+        ranges = [(min(start, total), min(end, total)) for key, found in by_key.items() if key not in truncated
+                  for start, end in found]
+        if covers_file(ranges, total):
+            covered.add(target)
+    return covered
+
+
 def note_mentions(text, directories, wanted, found):
     normalized = normalize(text)
     for target in wanted:
@@ -209,6 +279,7 @@ def note_mentions(text, directories, wanted, found):
 
 def collect_reads(journal, requested):
     complete = {}
+    slices = {}
     partial = set()
     delegated = set()
     truncated = set()
@@ -229,6 +300,7 @@ def collect_reads(journal, requested):
                 continue
             if is_compaction_boundary(record):
                 complete.clear()
+                slices.clear()
                 partial.clear()
                 delegated.clear()
                 truncated.clear()
@@ -256,6 +328,8 @@ def collect_reads(journal, requested):
                             continue
                         for target in note_cat(command, base, wanted):
                             complete.setdefault(target, set()).add(serial)
+                        for target, ranges in note_sed(command, base, wanted).items():
+                            slices.setdefault(target, {}).setdefault(serial, []).extend(ranges)
                         note_mentions(command, command_directories(command, base), wanted, partial)
                     elif name in DELEGATING_TOOLS:
                         prompt = inputs.get('prompt')
@@ -285,9 +359,12 @@ def collect_reads(journal, requested):
                         call_reads.setdefault(key, set()).update(found)
                         for target in found:
                             complete.setdefault(target, set()).add(key)
+                        for target, ranges in note_sed(command, call_directory, wanted).items():
+                            slices.setdefault(target, {}).setdefault(key, []).extend(ranges)
                 note_mentions(js_unescape(source), directories or {base}, wanted, partial)
 
-    return {target for target, keys in complete.items() if keys - truncated}, partial, delegated, invalid_lines
+    read = {target for target, keys in complete.items() if keys - truncated}
+    return read | sed_covered(slices, truncated, requested), partial, delegated, invalid_lines
 
 
 def main(argv):
@@ -301,7 +378,7 @@ def main(argv):
     paths = args[1:]
     try:
         complete, partial, delegated, invalid_lines = collect_reads(
-            journal, [canonical(path) for path in paths])
+            journal, {canonical(path): path for path in paths})
     except OSError as error:
         print(f'Cannot read journal: {error}', file=sys.stderr)
         return 2

@@ -627,6 +627,166 @@ class CheckReads(unittest.TestCase):
         self.assertFalse(lines[2].startswith('READ'), lines[2])
         self.assertEqual(lines[3], 'PART /srv/work/root/c.md')
 
+    def make_file(self, name, lines, final_newline=True):
+        path = os.path.join(self.tmp.name, name)
+        text = '\n'.join(f'line {number}' for number in range(1, lines + 1)) + ('\n' if final_newline else '')
+        with open(path, 'w', encoding='utf-8', newline='') as fh:
+            fh.write(text)
+        return path.replace('\\', '/')
+
+    def sed_journal(self, path, *scripts, truncated=()):
+        records = []
+        for index, script in enumerate(scripts):
+            call_id = f'call_{index}'
+            records.append(codex_exec(f"sed -n '{script}' {path}", call_id=call_id))
+            text = TRUNCATION_WARNING + 'x' if index in truncated else 'text'
+            records.append(codex_output(call_id, COMPLETE_HEADER, text))
+        return records
+
+    def assert_status(self, path, status, returncode):
+        result = self.run_cli(path)
+        self.assertEqual(result.returncode, returncode, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), [f'{status} {path}'])
+
+    def test_codex_sed_parts_covering_the_whole_file_are_read(self):
+        path = self.make_file('scout.md', 155)
+        self.write_journal(self.sed_journal(path, '1,55p', '56,112p', '113,155p'))
+
+        self.assert_status(path, 'READ', 0)
+
+    def test_codex_sed_parts_in_any_order_and_overlapping_are_read(self):
+        path = self.make_file('scout.md', 30)
+        self.write_journal(self.sed_journal(path, '20,30p', '1,12p', '10,22p'))
+
+        self.assert_status(path, 'READ', 0)
+
+    def test_codex_sed_hole_in_the_middle_is_part(self):
+        path = self.make_file('scout.md', 155)
+        self.write_journal(self.sed_journal(path, '1,55p', '57,112p', '113,155p'))
+
+        self.assert_status(path, 'PART', 1)
+
+    def test_codex_sed_missing_start_or_end_is_part(self):
+        path = self.make_file('scout.md', 20)
+        self.write_journal(self.sed_journal(path, '2,20p'))
+        self.assert_status(path, 'PART', 1)
+        self.write_journal(self.sed_journal(path, '1,19p'))
+        self.assert_status(path, 'PART', 1)
+
+    def test_codex_sed_truncated_part_adds_no_coverage(self):
+        path = self.make_file('scout.md', 155)
+        self.write_journal(self.sed_journal(path, '1,55p', '56,112p', '113,155p', truncated=(1,)))
+
+        self.assert_status(path, 'PART', 1)
+
+    def test_codex_sed_dollar_as_the_range_end_is_read(self):
+        path = self.make_file('scout.md', 155)
+        self.write_journal(self.sed_journal(path, '1,100p', '101,$p'))
+
+        self.assert_status(path, 'READ', 0)
+
+    def test_codex_sed_single_dollar_and_single_line_ranges_are_counted(self):
+        path = self.make_file('scout.md', 3)
+        self.write_journal(self.sed_journal(path, '1p', '2p', '$p'))
+
+        self.assert_status(path, 'READ', 0)
+
+    def test_codex_sed_range_end_beyond_the_file_is_clipped(self):
+        path = self.make_file('scout.md', 20)
+        self.write_journal(self.sed_journal(path, '1,500p'))
+
+        self.assert_status(path, 'READ', 0)
+
+    def test_codex_sed_several_ranges_in_one_script_are_counted(self):
+        path = self.make_file('scout.md', 20)
+        self.write_journal(self.sed_journal(path, '1,10p;11,20p'))
+        self.assert_status(path, 'READ', 0)
+        self.write_journal(self.sed_journal(path, '1,10p;12,20p'))
+        self.assert_status(path, 'PART', 1)
+
+    def test_codex_sed_unknown_script_adds_no_coverage(self):
+        path = self.make_file('scout.md', 20)
+        self.write_journal(self.sed_journal(path, '1,20d', '1,20p;s/a/b/'))
+
+        self.assert_status(path, 'PART', 1)
+
+    def test_codex_sed_commands_joined_in_one_call_with_relative_paths_are_read(self):
+        root = self.tmp.name.replace('\\', '/')
+        self.make_file('out.md', 155)
+        command = "sed -n '1,55p' out.md; sed -n '56,112p' out.md; sed -n '113,155p' out.md"
+        self.write_journal([
+            codex_turn_context(root),
+            codex_exec(command, call_id='call_all'),
+            codex_output('call_all', COMPLETE_HEADER, 'text'),
+        ])
+
+        self.assert_status(f'{root}/out.md', 'READ', 0)
+
+    def test_codex_sed_joined_call_with_truncated_output_adds_no_coverage(self):
+        root = self.tmp.name.replace('\\', '/')
+        self.make_file('out.md', 155)
+        command = "sed -n '1,55p' out.md; sed -n '56,155p' out.md"
+        self.write_journal([
+            codex_turn_context(root),
+            codex_exec(command, call_id='call_all'),
+            codex_output('call_all', COMPLETE_HEADER, TRUNCATION_WARNING + 'x'),
+        ])
+
+        self.assert_status(f'{root}/out.md', 'PART', 1)
+
+    def test_codex_sed_workdir_and_cd_resolve_relative_paths(self):
+        root = self.tmp.name.replace('\\', '/')
+        self.make_file('out.md', 20)
+        self.write_journal([
+            codex_exec("sed -n '1,10p' out.md", workdir=root),
+            codex_exec(f"cd {root} && sed -n '11,20p' out.md"),
+        ])
+
+        self.assert_status(f'{root}/out.md', 'READ', 0)
+
+    def test_codex_sed_file_without_final_newline_counts_the_last_line(self):
+        path = self.make_file('scout.md', 20, final_newline=False)
+        self.write_journal(self.sed_journal(path, '1,19p'))
+        self.assert_status(path, 'PART', 1)
+        self.write_journal(self.sed_journal(path, '1,20p'))
+        self.assert_status(path, 'READ', 0)
+
+    def test_codex_sed_missing_file_adds_no_coverage(self):
+        path = self.tmp.name.replace('\\', '/') + '/absent.md'
+        self.write_journal(self.sed_journal(path, '1,500p'))
+
+        self.assert_status(path, 'PART', 1)
+
+    def test_codex_sed_in_a_pipe_adds_no_coverage(self):
+        path = self.make_file('scout.md', 20)
+        self.write_journal([codex_exec(f"sed -n '1,20p' {path} | head -5", call_id='call_pipe')])
+
+        self.assert_status(path, 'PART', 1)
+
+    def test_codex_sed_coverage_is_reset_by_compaction(self):
+        path = self.make_file('scout.md', 155)
+        before = self.sed_journal(path, '1,55p', '56,112p')
+        after = self.sed_journal(path, '113,155p')
+        self.write_journal(before + [CODEX_COMPACTION] + after)
+        self.assert_status(path, 'PART', 1)
+
+        self.write_journal(before + [CODEX_COMPACTION])
+        self.assert_status(path, 'MISS', 1)
+
+    def test_claude_sed_parts_covering_the_whole_file_are_read(self):
+        path = self.make_file('scout.md', 20)
+        self.write_journal([
+            assistant(use('Bash', {'command': f"sed -n '1,10p' {path}"})),
+            assistant(use('Bash', {'command': f"sed -n '11,20p' {path}"})),
+        ])
+        self.assert_status(path, 'READ', 0)
+
+        self.write_journal([
+            assistant(use('Bash', {'command': f"sed -n '1,10p' {path}"})),
+            assistant(use('Bash', {'command': f"sed -n '12,20p' {path}"})),
+        ])
+        self.assert_status(path, 'PART', 1)
+
 
 if __name__ == '__main__':
     unittest.main()
