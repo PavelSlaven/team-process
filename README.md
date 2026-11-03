@@ -13,7 +13,7 @@
 - `cleanup.md` — уборка после задачи: папка задачи, раздел «Рабочие места» в сдаче, опись и удаление при закрытии.
 - `lessons.md` — уроки.
 - `tools/check-subagent-input.mjs` — проверка фактического входа субагента Workflow; тест: `node --test tools/check-subagent-input.test.mjs`.
-- `tools/check-reads.py` — проверка полного чтения файлов тем по журналу Claude; тест: `python3 -B -I -m unittest discover -s tools -p test_check_reads.py`.
+- `tools/check-reads.py [--deleg-ok] <журнал.jsonl> <путь>...` — проверка полного чтения файлов по журналу Claude или Codex (rollout; формат определяется по каждой записи). Статусы: `READ` (Read без offset и limit или `cat <путь>`), `DELEG` (путь в `prompt` вызова `Agent` или `Task` в журнале Claude), `PART` (любое другое упоминание пути в команде), `MISS`. Учитываются только записи после последней границы сжатия контекста (`compact_boundary` в журнале Claude, `compacted` в журнале Codex). Код выхода 0, если каждый путь `READ`; с `--deleg-ok` годится и `DELEG`. Тест: `python3 -B -I -m unittest discover -s tools -p test_check_reads.py`.
 - `tools/usage-daily.py` — дневной расход Claude и вызовы сессии с субагентами; тест: `python3 -B -I -m unittest discover -s tools -p test_usage_daily.py`.
 - `tools/codex-watch.py` — хроника работы Codex и его помощников за окно времени (повторы, провалы, сжатия, рабочая копия); тест: `python -I -m unittest discover -s tools -p test_supervise_tools.py`.
 - `tools/check-literal.py` — проверка буквальности задания или плана (расплывчатые обороты, голые пределы, раздел «Организация работы» при `--task`); тест тот же.
