@@ -13,6 +13,8 @@
 - `cleanup.md` — уборка после задачи: папка задачи, раздел «Рабочие места» в сдаче, опись и удаление при закрытии.
 - `lessons.md` — уроки.
 - `tools/check-subagent-input.mjs` — проверка фактического входа субагента Workflow; тест: `node --test tools/check-subagent-input.test.mjs`.
+- `tools/check-reads.py` — проверка полного чтения файлов тем по журналу Claude; тест: `python3 -B -I -m unittest discover -s tools -p test_check_reads.py`.
+- `tools/usage-daily.py` — дневной расход Claude и вызовы сессии с субагентами; тест: `python3 -B -I -m unittest discover -s tools -p test_usage_daily.py`.
 - `tools/codex-watch.py` — хроника работы Codex и его помощников за окно времени (повторы, провалы, сжатия, рабочая копия); тест: `python -I -m unittest discover -s tools -p test_supervise_tools.py`.
 - `tools/check-literal.py` — проверка буквальности задания или плана (расплывчатые обороты, голые пределы, раздел «Организация работы» при `--task`); тест тот же.
 - `tools/task-places.py` — опись мест задачи (рабочие копии, клоны, папки: несохранённые правки, коммиты не на удалённом, процессы, ссылки из живых файлов) и удаление с архивом несохранённого; тест: `python -I -m unittest discover -s tools -p test_task_places.py`.
