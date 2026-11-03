@@ -21,10 +21,33 @@ CLAUDE_COMPACTION = {'type': 'system', 'subtype': 'compact_boundary'}
 CODEX_COMPACTION = {'type': 'compacted', 'payload': {'message': ''}}
 
 
-def codex_exec(command):
-    source = 'const r = await tools.exec_command({cmd:' + json.dumps(command) + '});\ntext(r);'
+def codex_exec(command, call_id=None, workdir=None):
+    options = 'cmd:' + json.dumps(command)
+    if workdir is not None:
+        options += ', workdir:' + json.dumps(workdir)
+    source = 'const r = await tools.exec_command({' + options + '});\ntext(r);'
+    payload = {'type': 'custom_tool_call', 'name': 'exec', 'input': source}
+    if call_id is not None:
+        payload['call_id'] = call_id
+    return {'type': 'response_item', 'payload': payload}
+
+
+def codex_output(call_id, *texts):
     return {'type': 'response_item', 'payload': {
-        'type': 'custom_tool_call', 'name': 'exec', 'input': source}}
+        'type': 'custom_tool_call_output', 'call_id': call_id,
+        'output': [{'type': 'input_text', 'text': text} for text in texts]}}
+
+
+def codex_session_meta(cwd):
+    return {'type': 'session_meta', 'payload': {'cwd': cwd}}
+
+
+def codex_turn_context(cwd):
+    return {'type': 'turn_context', 'payload': {'cwd': cwd}}
+
+
+COMPLETE_HEADER = 'Script completed\nWall time 0.2 seconds\nOutput:\n'
+TRUNCATION_WARNING = 'Warning: truncated output (original token count: 12528)\nTotal output lines: 1\n\n'
 
 
 class CheckReads(unittest.TestCase):
@@ -437,6 +460,172 @@ class CheckReads(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines(), [f'READ {target}'])
+
+    def test_codex_relative_cat_resolves_from_turn_context_cwd(self):
+        root = '/srv/work/tests-961'
+        self.write_journal([
+            codex_turn_context(root),
+            codex_exec('cat .t/in/goal.md ./.t/in/spec.md'),
+        ])
+
+        result = self.run_cli(f'{root}/.t/in/goal.md', f'{root}/.t/in/spec.md')
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), [
+            f'READ {root}/.t/in/goal.md', f'READ {root}/.t/in/spec.md'])
+
+    def test_codex_last_cwd_wins_and_session_meta_is_the_fallback(self):
+        self.write_journal([
+            codex_session_meta('/srv/work/meta'),
+            codex_exec('cat first.md'),
+            codex_turn_context('/srv/work/old'),
+            codex_turn_context('/srv/work/new'),
+            codex_exec('cat rules.md'),
+        ])
+
+        result = self.run_cli('/srv/work/meta/first.md', '/srv/work/new/rules.md', '/srv/work/old/rules.md')
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), [
+            'READ /srv/work/meta/first.md', 'READ /srv/work/new/rules.md', 'MISS /srv/work/old/rules.md'])
+
+    def test_codex_workdir_of_the_call_overrides_cwd(self):
+        self.write_journal([
+            codex_turn_context('/srv/work/a'),
+            codex_exec('cat rules.md', workdir='/srv/work/b'),
+        ])
+
+        result = self.run_cli('/srv/work/b/rules.md', '/srv/work/a/rules.md')
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ['READ /srv/work/b/rules.md', 'MISS /srv/work/a/rules.md'])
+
+    def test_codex_cd_in_the_chain_changes_directory_for_later_parts_only(self):
+        self.write_journal([
+            codex_turn_context('/srv/work/root'),
+            codex_exec('cat before.md && cd /srv/work/other && cat after.md'),
+            codex_exec('cd sub; cat inner.md'),
+        ])
+
+        result = self.run_cli(
+            '/srv/work/root/before.md', '/srv/work/other/before.md',
+            '/srv/work/other/after.md', '/srv/work/root/after.md',
+            '/srv/work/root/sub/inner.md', '/srv/work/root/inner.md')
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual([line.split()[0] == 'READ' for line in result.stdout.splitlines()],
+                         [True, False, True, False, True, False])
+
+    def test_codex_cd_x_and_cat_y_reads_x_slash_y(self):
+        self.write_journal([codex_turn_context('/srv/work/root'), codex_exec('cd /srv/work/x && cat y.md')])
+
+        result = self.run_cli('/srv/work/x/y.md')
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ['READ /srv/work/x/y.md'])
+
+    def test_codex_relative_path_without_match_is_miss_and_dotdot_is_resolved(self):
+        self.write_journal([codex_turn_context('/srv/work/root'), codex_exec('cat other/z.md ../up.md')])
+
+        result = self.run_cli('/srv/work/root/z.md', '/srv/work/root/up.md', '/srv/work/up.md')
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), [
+            'MISS /srv/work/root/z.md', 'MISS /srv/work/root/up.md', 'READ /srv/work/up.md'])
+
+    def test_codex_relative_sed_is_part(self):
+        self.write_journal([codex_turn_context('/srv/work/root'), codex_exec('sed -n 1,5p in/a.md')])
+
+        result = self.run_cli('/srv/work/root/in/a.md')
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ['PART /srv/work/root/in/a.md'])
+
+    def test_codex_cwd_survives_compaction(self):
+        self.write_journal([
+            codex_turn_context('/srv/work/root'),
+            codex_exec('cat before.md'),
+            CODEX_COMPACTION,
+            codex_exec('cat after.md'),
+        ])
+
+        result = self.run_cli('/srv/work/root/before.md', '/srv/work/root/after.md')
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), [
+            'MISS /srv/work/root/before.md', 'READ /srv/work/root/after.md'])
+
+    def test_codex_truncated_output_makes_every_file_of_the_call_part(self):
+        root = '/srv/work/tests-961'
+        self.write_journal([
+            codex_turn_context(root),
+            codex_exec('cat .t/goal.md .t/spec.md', call_id='call_cut'),
+            codex_output('call_cut', COMPLETE_HEADER, TRUNCATION_WARNING + '{"output":"..."}'),
+            codex_exec('cat .t/whole.md', call_id='call_whole'),
+            codex_output('call_whole', COMPLETE_HEADER, 'text'),
+        ])
+
+        result = self.run_cli(f'{root}/.t/goal.md', f'{root}/.t/spec.md', f'{root}/.t/whole.md')
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), [
+            f'PART {root}/.t/goal.md', f'PART {root}/.t/spec.md', f'READ {root}/.t/whole.md'])
+
+    def test_codex_truncated_output_of_absolute_cat_is_part(self):
+        target = '/srv/work/abs.md'
+        self.write_journal([
+            codex_exec(f'cat {target}', call_id='call_cut'),
+            codex_output('call_cut', TRUNCATION_WARNING + 'x'),
+        ])
+
+        result = self.run_cli(target)
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), [f'PART {target}'])
+
+    def test_codex_whole_cat_in_another_call_beats_truncated_one(self):
+        target = '/srv/work/twice.md'
+        self.write_journal([
+            codex_exec(f'cat {target}', call_id='call_cut'),
+            codex_output('call_cut', TRUNCATION_WARNING + 'x'),
+            codex_exec(f'cat {target}', call_id='call_whole'),
+            codex_output('call_whole', COMPLETE_HEADER, 'text'),
+        ])
+
+        result = self.run_cli(target)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), [f'READ {target}'])
+
+    def test_codex_warning_text_inside_a_line_is_not_truncation(self):
+        target = '/srv/work/note.md'
+        self.write_journal([
+            codex_exec(f'cat {target}', call_id='call_note'),
+            codex_output('call_note', COMPLETE_HEADER, 'He wrote Warning: truncated output (original token count: 5)'),
+        ])
+
+        result = self.run_cli(target)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), [f'READ {target}'])
+
+    def test_claude_record_cwd_resolves_relative_cat_and_cd(self):
+        self.write_journal([
+            {'type': 'assistant', 'cwd': '/srv/work/root', 'message': {'content': [
+                use('Bash', {'command': 'cat in/a.md'}),
+                use('Bash', {'command': 'cd sub && cat b.md'}),
+                use('Read', {'file_path': 'c.md', 'limit': 5}),
+            ]}},
+        ])
+
+        result = self.run_cli(
+            '/srv/work/root/in/a.md', '/srv/work/root/sub/b.md', '/srv/work/root/b.md', '/srv/work/root/c.md')
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        lines = result.stdout.splitlines()
+        self.assertEqual(lines[:2], ['READ /srv/work/root/in/a.md', 'READ /srv/work/root/sub/b.md'])
+        self.assertFalse(lines[2].startswith('READ'), lines[2])
+        self.assertEqual(lines[3], 'PART /srv/work/root/c.md')
 
 
 if __name__ == '__main__':

@@ -1,19 +1,54 @@
 import json
+import posixpath
 import re
 import shlex
 import sys
 
 DELEGATING_TOOLS = ('Agent', 'Task')
 SHELL_OPERATORS = '();<>|&\n'
-CMD_LITERAL = re.compile(
-    r'''\bcmd["']?\s*:\s*(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|`((?:[^`\\]|\\.)*)`)''',
-    re.S)
 JS_ESCAPE = re.compile(r'\\(u\{[0-9a-fA-F]{1,5}\}|u[0-9a-fA-F]{4}|x[0-9a-fA-F]{2}|\r?\n|.)', re.S)
 JS_SIMPLE_ESCAPES = {'n': '\n', 't': '\t', 'r': '\r', '0': '\0'}
+EXEC_SPLIT = re.compile(r'(?=\bexec_command\b)')
+TRUNCATED_OUTPUT = re.compile(r'^Warning: truncated output \(original token count: \d+\)', re.M)
+ABSOLUTE_PATH = re.compile(r'^(?:/|[a-z]:/)')
+
+
+def literal_pattern(key):
+    return re.compile(
+        r'''\b''' + key + r'''["']?\s*:\s*(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|`((?:[^`\\]|\\.)*)`)''',
+        re.S)
+
+
+CMD_LITERAL = literal_pattern('cmd')
+WORKDIR_LITERAL = literal_pattern('workdir')
 
 
 def normalize(value):
     return value.replace('\\', '/').lower()
+
+
+def canonical(value):
+    return posixpath.normpath(normalize(value))
+
+
+def resolve(path, directory):
+    target = normalize(path)
+    if directory and not ABSOLUTE_PATH.match(target):
+        target = directory + '/' + target
+    return posixpath.normpath(target)
+
+
+def candidates(path, directory):
+    return {canonical(path), resolve(path, directory)}
+
+
+def mention_names(target, directories):
+    yield target
+    for directory in directories:
+        if directory and target.startswith(directory + '/'):
+            relative = target[len(directory) + 1:]
+            yield relative
+            yield './' + relative
 
 
 def mentions_path(command, target):
@@ -48,6 +83,10 @@ def js_unescape(text):
     return JS_ESCAPE.sub(replace, text)
 
 
+def literal_value(match):
+    return js_unescape(next(group for group in match.groups() if group is not None))
+
+
 def claude_tool_uses(record):
     message = record.get('message')
     content = message.get('content') if isinstance(message, dict) else None
@@ -67,10 +106,33 @@ def codex_exec_source(record):
     return None
 
 
-def codex_commands(source):
+def codex_calls(source):
     # Codex записывает команду как строковый литерал в JavaScript-коде вызова tools.exec_command({cmd: "..."}).
-    for match in CMD_LITERAL.finditer(source):
-        yield js_unescape(next(group for group in match.groups() if group is not None))
+    for part in EXEC_SPLIT.split(source):
+        workdir = WORKDIR_LITERAL.search(part)
+        yield (
+            literal_value(workdir) if workdir else None,
+            [literal_value(match) for match in CMD_LITERAL.finditer(part)])
+
+
+def codex_output_text(record):
+    payload = record.get('payload')
+    if not isinstance(payload, dict) or payload.get('type') != 'custom_tool_call_output':
+        return None
+    output = payload.get('output')
+    if isinstance(output, list):
+        output = '\n'.join(
+            block['text'] for block in output if isinstance(block, dict) and isinstance(block.get('text'), str))
+    return output if isinstance(output, str) else ''
+
+
+def record_cwd(record):
+    payload = record.get('payload')
+    if record.get('type') in ('session_meta', 'turn_context') and isinstance(payload, dict):
+        value = payload.get('cwd')
+    else:
+        value = record.get('cwd')
+    return value if isinstance(value, str) and value else None
 
 
 def is_compaction_boundary(record):
@@ -89,13 +151,20 @@ def shell_tokens(command, posix):
     return list(lexer)
 
 
-def cat_arguments(command):
+def cd_directory(words, directory):
+    if len(words) != 2 or words[1] == '-' or words[1].startswith('~'):
+        return None
+    return resolve(words[1], directory)
+
+
+def chain_parts(command, directory):
     # Разбор в режиме posix съедает обратные слэши в пути Windows, а режим без posix не понимает экранирование.
     for posix in (True, False):
         try:
             tokens = shell_tokens(command, posix)
         except ValueError:
             continue
+        current_directory = directory
         current = []
         for token in tokens + [';']:
             if not is_shell_operator(token):
@@ -106,32 +175,48 @@ def cat_arguments(command):
             previous = current[-1] if current else ''
             if token in ('>&', '<&') or (token in ('>', '>>') and previous.isdigit() and previous != '1'):
                 continue
-            hides_output = (token[0] == '|' and token[:2] != '||') or token in ('>', '>>', '&>', '&>>')
-            if current[:1] == ['cat'] and not hides_output:
-                yield from current[1:]
+            yield current, token, current_directory
+            if current[:1] == ['cd']:
+                current_directory = cd_directory(current, current_directory)
             current = []
 
 
-def note_cat(command, wanted, complete):
-    for argument in cat_arguments(command):
-        target = normalize(argument)
-        if target in wanted:
-            complete.add(target)
+def cat_arguments(command, directory):
+    for words, operator, part_directory in chain_parts(command, directory):
+        hides_output = (operator[0] == '|' and operator[:2] != '||') or operator in ('>', '>>', '&>', '&>>')
+        if words[:1] == ['cat'] and not hides_output:
+            for word in words[1:]:
+                yield word, part_directory
 
 
-def note_mentions(text, wanted, found):
+def command_directories(command, directory):
+    return {part_directory for _, _, part_directory in chain_parts(command, directory)} | {directory}
+
+
+def note_cat(command, directory, wanted):
+    found = set()
+    for argument, part_directory in cat_arguments(command, directory):
+        found |= candidates(argument, part_directory) & wanted
+    return found
+
+
+def note_mentions(text, directories, wanted, found):
     normalized = normalize(text)
     for target in wanted:
-        if mentions_path(normalized, target):
+        if any(mentions_path(normalized, name) for name in mention_names(target, directories)):
             found.add(target)
 
 
 def collect_reads(journal, requested):
-    complete = set()
+    complete = {}
     partial = set()
     delegated = set()
+    truncated = set()
+    call_reads = {}
     invalid_lines = 0
     wanted = set(requested)
+    cwd = None
+    serial = 0
 
     with open(journal, encoding='utf-8') as fh:
         for line in fh:
@@ -146,7 +231,12 @@ def collect_reads(journal, requested):
                 complete.clear()
                 partial.clear()
                 delegated.clear()
+                truncated.clear()
+                call_reads.clear()
                 continue
+            cwd = record_cwd(record) or cwd
+            base = canonical(cwd) if cwd else None
+            serial += 1
             kind = record.get('type')
             if kind == 'assistant':
                 for name, inputs in claude_tool_uses(record):
@@ -154,32 +244,50 @@ def collect_reads(journal, requested):
                         path = inputs.get('file_path')
                         if not isinstance(path, str):
                             continue
-                        target = normalize(path)
-                        if target not in wanted:
-                            continue
+                        found = candidates(path, base) & wanted
                         if 'offset' in inputs or 'limit' in inputs:
-                            partial.add(target)
+                            partial.update(found)
                         else:
-                            complete.add(target)
+                            for target in found:
+                                complete.setdefault(target, set()).add(serial)
                     elif name == 'Bash':
                         command = inputs.get('command')
                         if not isinstance(command, str):
                             continue
-                        note_cat(command, wanted, complete)
-                        note_mentions(command, wanted, partial)
+                        for target in note_cat(command, base, wanted):
+                            complete.setdefault(target, set()).add(serial)
+                        note_mentions(command, command_directories(command, base), wanted, partial)
                     elif name in DELEGATING_TOOLS:
                         prompt = inputs.get('prompt')
                         if isinstance(prompt, str):
-                            note_mentions(prompt, wanted, delegated)
+                            note_mentions(prompt, [], wanted, delegated)
             elif kind == 'response_item':
+                output = codex_output_text(record)
+                if output is not None:
+                    call_id = record['payload'].get('call_id')
+                    if isinstance(call_id, str) and TRUNCATED_OUTPUT.search(output):
+                        truncated.add(call_id)
+                        partial.update(call_reads.get(call_id, ()))
+                    continue
                 source = codex_exec_source(record)
                 if source is None:
                     continue
-                for command in codex_commands(source):
-                    note_cat(command, wanted, complete)
-                note_mentions(js_unescape(source), wanted, partial)
+                call_id = record['payload'].get('call_id')
+                key = call_id if isinstance(call_id, str) else serial
+                directories = set()
+                for workdir, commands in codex_calls(source):
+                    call_directory = resolve(workdir, base) if workdir else base
+                    if workdir:
+                        directories.add(call_directory)
+                    for command in commands:
+                        directories |= command_directories(command, call_directory)
+                        found = note_cat(command, call_directory, wanted)
+                        call_reads.setdefault(key, set()).update(found)
+                        for target in found:
+                            complete.setdefault(target, set()).add(key)
+                note_mentions(js_unescape(source), directories or {base}, wanted, partial)
 
-    return complete, partial, delegated, invalid_lines
+    return {target for target, keys in complete.items() if keys - truncated}, partial, delegated, invalid_lines
 
 
 def main(argv):
@@ -193,14 +301,14 @@ def main(argv):
     paths = args[1:]
     try:
         complete, partial, delegated, invalid_lines = collect_reads(
-            journal, [normalize(path) for path in paths])
+            journal, [canonical(path) for path in paths])
     except OSError as error:
         print(f'Cannot read journal: {error}', file=sys.stderr)
         return 2
 
     ok = True
     for path in paths:
-        target = normalize(path)
+        target = canonical(path)
         if target in complete:
             status = 'READ'
         elif target in delegated:
