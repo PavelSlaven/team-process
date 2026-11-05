@@ -150,6 +150,49 @@ class CheckReads(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertEqual(result.stdout.splitlines(), [f'PART {offset_path}', f'PART {limit_path}'])
 
+    def write_lines(self, name, count):
+        path = os.path.join(self.tmp.name, name)
+        with open(path, 'w', encoding='utf-8') as fh:
+            fh.write(''.join(f'line {n}\n' for n in range(1, count + 1)))
+        return path
+
+    def test_read_chunks_covering_every_line_are_read(self):
+        target = self.write_lines('chunks.md', 10)
+        self.write_journal([
+            assistant(use('Read', {'file_path': target, 'limit': 4})),
+            assistant(use('Read', {'file_path': target, 'offset': 4, 'limit': 7})),
+        ])
+
+        result = self.run_cli(target)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), [f'READ {target}'])
+
+    def test_read_chunks_with_gap_are_partial(self):
+        target = self.write_lines('gap.md', 10)
+        self.write_journal([
+            assistant(use('Read', {'file_path': target, 'offset': 1, 'limit': 3})),
+            assistant(use('Read', {'file_path': target, 'offset': 5, 'limit': 6})),
+        ])
+
+        result = self.run_cli(target)
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), [f'PART {target}'])
+
+    def test_read_chunks_before_compaction_do_not_count(self):
+        target = self.write_lines('compacted.md', 10)
+        self.write_journal([
+            assistant(use('Read', {'file_path': target, 'limit': 5})),
+            CLAUDE_COMPACTION,
+            assistant(use('Read', {'file_path': target, 'offset': 6, 'limit': 5})),
+        ])
+
+        result = self.run_cli(target)
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), [f'PART {target}'])
+
     def test_complete_read_after_partial_takes_priority(self):
         target = os.path.join(self.tmp.name, 'target.md')
         self.write_journal([

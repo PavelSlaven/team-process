@@ -319,6 +319,13 @@ def collect_reads(journal, requested):
                         found = candidates(path, base) & wanted
                         if 'offset' in inputs or 'limit' in inputs:
                             partial.update(found)
+                            offset, limit = inputs.get('offset'), inputs.get('limit')
+                            start = offset if type(offset) is int and offset > 0 else 1
+                            # 2000 — число строк, которое Read отдаёт без limit.
+                            count = limit if type(limit) is int and limit > 0 else 2000
+                            for target in found:
+                                slices.setdefault(target, {}).setdefault(serial, []).append(
+                                    (start, start + count - 1))
                         else:
                             for target in found:
                                 complete.setdefault(target, set()).add(serial)
