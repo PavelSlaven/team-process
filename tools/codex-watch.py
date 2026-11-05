@@ -4,6 +4,7 @@ import collections
 import datetime as dt
 import glob
 import json
+import ntpath
 import os
 import re
 import subprocess
@@ -64,7 +65,7 @@ def scan(path, since):
                 for path, ch in (it.get('changes') or {}).items():
                     edits += 1
                     diff = str(ch.get('unified_diff') or '')
-                    timeline.append(f"{hm} EDIT {ch.get('type')} {os.path.basename(path)}:\n    {diff[:800]}")
+                    timeline.append(f"{hm} EDIT {ch.get('type')} {ntpath.basename(path)}:\n    {diff[:800]}")
             if it.get('type') == 'CollabAgentToolCall':
                 spawns += 1
         if p.get('type') == 'message' and p.get('role') == 'assistant':
