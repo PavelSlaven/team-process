@@ -1,0 +1,38 @@
+{
+  "tasks_dir": "/path/to/launcher/tasks",
+  "proc_dir": "/proc",
+  "accounts": {
+    "demo": {
+      "codex_home": "/path/to/codex-home",
+      "slots": 1,
+      "helper_limit": 60,
+      "plan_deadline": null
+    }
+  },
+  "plan": {
+    "path": "/path/to/STATE.md",
+    "columns": {
+      "task": "Задача",
+      "thread": "Нить",
+      "status": "Его статус",
+      "account": null
+    },
+    "ready_prefix": "Готова к запуску",
+    "closed_prefixes": ["Принята", "Сохранена", "Закрыта"]
+  },
+  "extra_allowed_paths": ["/tmp"],
+  "report_path": "/path/to/load-report.txt",
+  "signal_path": "/path/to/load-signal.md",
+  "thresholds": {
+    "window_minutes": 30,
+    "rate_snapshot_hours": 6,
+    "underuse_pp": 10,
+    "idle_minutes": 20,
+    "waiting_minutes": 15,
+    "repeat_count": 3,
+    "stagnation_minutes": 120,
+    "data_grace_minutes": 5,
+    "leader_command_count": 20,
+    "runtime_seconds": 60
+  }
+}
