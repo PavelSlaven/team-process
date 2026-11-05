@@ -1,2 +1,3 @@
 *.bak-*
 __pycache__/
+.load-check-tests/

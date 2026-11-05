@@ -1,23 +1,35 @@
 """Look at a Codex lead thread and its helpers: activity, repeats, failures, compactions."""
 import argparse
-import collections
 import datetime as dt
 import glob
+import importlib.util
 import json
+import ntpath
 import os
 import re
 import subprocess
 import sys
 
 
+def load_shared():
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'codex-load-check.py')
+    spec = importlib.util.spec_from_file_location('codex_load_check_shared', path)
+    module = importlib.util.module_from_spec(spec)
+    previous = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = previous
+    return module
+
+
+shared = load_shared()
+norm = shared.norm
+
+
 def parse_ts(d):
     return dt.datetime.fromisoformat(d['timestamp'].replace('Z', '+00:00'))
-
-
-def norm(cmd):
-    cmd = re.sub(r'\s+', ' ', cmd)
-    i = cmd.find("'-Command', ")
-    return cmd[i + 12:] if i >= 0 else cmd
 
 
 def head_of(path):
@@ -28,7 +40,7 @@ def head_of(path):
 def scan(path, since):
     m = re.search(r'"agent_nickname":"([^"]*)"', head_of(path))
     name = m.group(1) if m else 'LEAD'
-    cmds, fails, compactions, msgs, last = collections.Counter(), [], 0, [], None
+    cmds, fails, compactions, msgs, last = shared.new_counter(), [], 0, [], None
     spawns, edits, timeline, progress = 0, 0, [], None
     for line in open(path, encoding='utf-8', errors='replace'):
         try:
@@ -54,8 +66,9 @@ def scan(path, since):
         if p.get('type') == 'item_completed':
             it = p.get('item') or {}
             if it.get('type') == 'CommandExecution':
-                c = norm(str(it.get('command')))
-                cmds[c] += 1
+                c = str(it.get('command'))
+                shared.record_attempt(cmds, c)
+                c = norm(c)
                 outp = re.sub(r'\s+', ' ', str(it.get('aggregated_output') or ''))
                 timeline.append(f"{hm} CMD exit {it.get('exit_code')}: {c[:600]}\n    OUT: {outp[:400]}")
                 if str(it.get('exit_code')) not in ('0', 'None'):
@@ -64,7 +77,7 @@ def scan(path, since):
                 for path, ch in (it.get('changes') or {}).items():
                     edits += 1
                     diff = str(ch.get('unified_diff') or '')
-                    timeline.append(f"{hm} EDIT {ch.get('type')} {os.path.basename(path)}:\n    {diff[:800]}")
+                    timeline.append(f"{hm} EDIT {ch.get('type')} {ntpath.basename(path)}:\n    {diff[:800]}")
             if it.get('type') == 'CollabAgentToolCall':
                 spawns += 1
         if p.get('type') == 'message' and p.get('role') == 'assistant':
