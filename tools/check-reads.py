@@ -9,7 +9,9 @@ SHELL_OPERATORS = '();<>|&\n'
 JS_ESCAPE = re.compile(r'\\(u\{[0-9a-fA-F]{1,5}\}|u[0-9a-fA-F]{4}|x[0-9a-fA-F]{2}|\r?\n|.)', re.S)
 JS_SIMPLE_ESCAPES = {'n': '\n', 't': '\t', 'r': '\r', '0': '\0'}
 EXEC_SPLIT = re.compile(r'(?=\bexec_command\b)')
-TRUNCATED_OUTPUT = re.compile(r'^Warning: truncated output \(original token count: \d+\)', re.M)
+TRUNCATED_OUTPUT = re.compile(
+    r'^Warning: truncated output \(original token count: \d+\)|\.\.\. \d+ bytes omitted \.\.\.|…\d+ tokens truncated…',
+    re.M)
 ABSOLUTE_PATH = re.compile(r'^(?:/|[a-z]:/)')
 SED_RANGE = re.compile(r'^(\d+|\$)(?:,(\d+|\$))?p$')
 LAST_LINE = sys.maxsize
@@ -126,6 +128,164 @@ def codex_output_text(record):
         output = '\n'.join(
             block['text'] for block in output if isinstance(block, dict) and isinstance(block.get('text'), str))
     return output if isinstance(output, str) else ''
+
+
+def output_is_truncated(text):
+    return bool(TRUNCATED_OUTPUT.search(text))
+
+
+def result_outputs(value, address):
+    if isinstance(value, dict):
+        if isinstance(value.get('output'), str) and ('exit_code' in value or 'session_id' in value):
+            yield address + '.output', value['output']
+        elif 'result' in value:
+            yield from result_outputs(value['result'], address + '.result')
+        elif 'value' in value and value.get('status') == 'fulfilled':
+            yield from result_outputs(value['value'], address + '.value')
+    elif isinstance(value, list):
+        for i, item in enumerate(value):
+            yield from result_outputs(item, f'{address}[{i}]')
+
+
+def codex_command_outputs(record):
+    output = record['payload'].get('output')
+    if isinstance(output, list):
+        blocks = [(f'payload.output[{i}].text', block['text']) for i, block in enumerate(output)
+                  if isinstance(block, dict) and isinstance(block.get('text'), str)]
+    elif isinstance(output, str):
+        blocks = [('payload.output', output)]
+    else:
+        blocks = []
+    results = []
+    outer_cut = False
+    for address, text in blocks:
+        try:
+            decoded = json.loads(text)
+        except (ValueError, TypeError):
+            decoded = None
+        nested = list(result_outputs(decoded, address + '<json>'))
+        if nested:
+            results.extend((route, body, output_is_truncated(body)) for route, body in nested)
+        else:
+            cut = output_is_truncated(text)
+            outer_cut = outer_cut or cut
+            results.append((address, text, cut))
+    return results, outer_cut
+
+
+def split_lines(text):
+    lines = text.split('\n')
+    if lines[-1] == '':
+        lines.pop()
+    return [line.removesuffix('\r') for line in lines]
+
+
+def read_source_lines(path):
+    try:
+        with open(path, 'rb') as fh:
+            data = fh.read()
+    except OSError:
+        return None, None
+    total = data.count(b'\n') + (1 if data and not data.endswith(b'\n') else 0)
+    try:
+        return split_lines(data.decode('utf-8')), total
+    except UnicodeError:
+        return None, total
+
+
+def output_line_variants(text):
+    return [tuple(dict.fromkeys((line, re.sub(r'^\s*\d+\t', '', line)))) for line in split_lines(text)]
+
+
+class ContentCoverage:
+    def __init__(self, lines):
+        self.lines = lines
+        self.index = {}
+        for i, line in enumerate(lines):
+            self.index.setdefault(line, []).append(i)
+        self.lengths = [len(line.encode('utf-8')) for line in lines]
+        self.reset()
+
+    def reset(self):
+        self.full = set()
+        self.prefix = {}
+        self.suffix = {}
+
+    def note_edge(self, i, variants, prefix):
+        line = self.lines[i]
+        if line in variants:
+            self.full.add(i)
+        matches = [len(v.encode('utf-8')) for v in variants
+                   if v and (line.startswith(v) if prefix else line.endswith(v))]
+        if matches:
+            edges = self.prefix if prefix else self.suffix
+            edges[i] = max(edges.get(i, 0), max(matches))
+
+    def note(self, output):
+        count = len(self.lines)
+        if not count:
+            return
+        if count == 1:
+            if any(self.lines[0] in variants for variants in output):
+                self.full.add(0)
+            return
+        if count == 2:
+            for first, last in zip(output, output[1:]):
+                left = any(v == self.lines[0] or (v and self.lines[0].endswith(v)) for v in first)
+                right = any(v == self.lines[1] or (v and self.lines[1].startswith(v)) for v in last)
+                if left and right:
+                    self.note_edge(0, first, False)
+                    self.note_edge(1, last, True)
+            return
+        previous = {}
+        for j, variants in enumerate(output):
+            current = {}
+            for i in {i for variant in variants for i in self.index.get(variant, ())}:
+                length = previous.get(i - 1, 0) + 1
+                current[i] = length
+                if i + 1 < count and j + 1 < len(output) and self.lines[i + 1] in output[j + 1]:
+                    continue
+                a, b = i - length + 1, j - length + 1
+                left = a > 0 and b > 0 and any(
+                    v and self.lines[a - 1].endswith(v) for v in output[b - 1])
+                right = i + 1 < count and j + 1 < len(output) and any(
+                    v and self.lines[i + 1].startswith(v) for v in output[j + 1])
+                if length + bool(left) + bool(right) < 3:
+                    continue
+                self.full.update(range(a, i + 1))
+                if left:
+                    self.note_edge(a - 1, output[b - 1], False)
+                if right:
+                    self.note_edge(i + 1, output[j + 1], True)
+            previous = current
+
+    def covered_lines(self):
+        return self.full | {i for i, size in enumerate(self.lengths)
+                            if size and self.prefix.get(i, 0) + self.suffix.get(i, 0) >= size}
+
+
+def parse_request(argument):
+    match = re.fullmatch(r'(.+):(\d+)-(\d+)', argument)
+    if match:
+        path, start, end = match.groups()
+        start, end = int(start), int(end)
+        if start < 1 or start > end:
+            raise ValueError(f'Invalid range: {argument}')
+        return path, (start, end)
+    tail = argument.rsplit(':', 1)
+    drive = len(tail) == 2 and len(tail[0]) == 1 and tail[0].isalpha()
+    if len(tail) == 2 and not drive and ('-' in tail[1] or tail[1][:1].isdigit()):
+        raise ValueError(f'Invalid range: {argument}')
+    return argument, None
+
+
+def covers_range(ranges, first, last):
+    reached = first - 1
+    for start, end in sorted(ranges):
+        if start > reached + 1:
+            break
+        reached = max(reached, end)
+    return reached >= last
 
 
 def record_cwd(record):
@@ -277,13 +437,14 @@ def note_mentions(text, directories, wanted, found):
             found.add(target)
 
 
-def collect_reads(journal, requested):
+def collect_reads(journal, requested, sources, totals):
     complete = {}
     slices = {}
     partial = set()
     delegated = set()
     truncated = set()
     call_reads = {}
+    exec_calls = set()
     invalid_lines = 0
     wanted = set(requested)
     cwd = None
@@ -305,6 +466,9 @@ def collect_reads(journal, requested):
                 delegated.clear()
                 truncated.clear()
                 call_reads.clear()
+                exec_calls.clear()
+                for source in sources.values():
+                    source.reset()
                 continue
             cwd = record_cwd(record) or cwd
             base = canonical(cwd) if cwd else None
@@ -343,18 +507,29 @@ def collect_reads(journal, requested):
                         if isinstance(prompt, str):
                             note_mentions(prompt, [], wanted, delegated)
             elif kind == 'response_item':
-                output = codex_output_text(record)
-                if output is not None:
-                    call_id = record['payload'].get('call_id')
-                    if isinstance(call_id, str) and TRUNCATED_OUTPUT.search(output):
+                payload = record.get('payload')
+                if isinstance(payload, dict) and payload.get('type') == 'custom_tool_call_output':
+                    call_id = payload.get('call_id')
+                    if not isinstance(call_id, str) or call_id not in exec_calls:
+                        continue
+                    outputs, outer_cut = codex_command_outputs(record)
+                    if outer_cut or any(cut for _, _, cut in outputs):
                         truncated.add(call_id)
                         partial.update(call_reads.get(call_id, ()))
+                    if not outer_cut:
+                        for _, text, cut in outputs:
+                            if not cut:
+                                variants = output_line_variants(text)
+                                for coverage in sources.values():
+                                    coverage.note(variants)
                     continue
                 source = codex_exec_source(record)
                 if source is None:
                     continue
                 call_id = record['payload'].get('call_id')
                 key = call_id if isinstance(call_id, str) else serial
+                if isinstance(call_id, str):
+                    exec_calls.add(call_id)
                 directories = set()
                 for workdir, commands in codex_calls(source):
                     call_directory = resolve(workdir, base) if workdir else base
@@ -371,7 +546,20 @@ def collect_reads(journal, requested):
                 note_mentions(js_unescape(source), directories or {base}, wanted, partial)
 
     read = {target for target, keys in complete.items() if keys - truncated}
-    return read | sed_covered(slices, truncated, requested), partial, delegated, invalid_lines
+    ranges = {}
+    for target, by_key in slices.items():
+        total = totals.get(target, 0)
+        ranges[target] = [(min(start, total), min(end, total)) if total else (start, end)
+                          for key, found in by_key.items() if key not in truncated for start, end in found]
+    for target, source in sources.items():
+        visible = source.covered_lines()
+        if visible:
+            partial.add(target)
+            ranges.setdefault(target, []).extend((i + 1, i + 1) for i in visible)
+    for target, total in totals.items():
+        if total and covers_range(ranges.get(target, []), 1, total):
+            read.add(target)
+    return read, partial, delegated, invalid_lines, ranges
 
 
 def main(argv):
@@ -384,16 +572,44 @@ def main(argv):
     journal = args[0]
     paths = args[1:]
     try:
-        complete, partial, delegated, invalid_lines = collect_reads(
-            journal, {canonical(path): path for path in paths})
+        requests = [parse_request(path) for path in paths]
+        requested = {canonical(path): path for path, _ in requests}
+        sources = {}
+        totals = {}
+        for target, path in requested.items():
+            lines, total = read_source_lines(path)
+            if total is not None:
+                totals[target] = total
+            if lines is not None:
+                sources[target] = ContentCoverage(lines)
+        for argument, (path, interval) in zip(paths, requests):
+            target = canonical(path)
+            if interval and target in totals and interval[1] > totals[target]:
+                raise ValueError(f'Range past end of file: {argument}')
+    except ValueError as error:
+        print(error, file=sys.stderr)
+        return 2
+    try:
+        complete, partial, delegated, invalid_lines, ranges = collect_reads(journal, requested, sources, totals)
     except OSError as error:
         print(f'Cannot read journal: {error}', file=sys.stderr)
         return 2
 
     ok = True
-    for path in paths:
-        target = canonical(path)
-        if target in complete:
+    for path, (physical_path, interval) in zip(paths, requests):
+        target = canonical(physical_path)
+        if interval:
+            first, last = interval
+            found = ranges.get(target, [])
+            if target in complete or covers_range(found, first, last):
+                status = 'READ'
+            elif any(start <= last and end >= first for start, end in found):
+                status = 'PART'
+                ok = False
+            else:
+                status = 'MISS'
+                ok = False
+        elif target in complete:
             status = 'READ'
         elif target in delegated:
             status = 'DELEG'

@@ -831,5 +831,481 @@ class CheckReads(unittest.TestCase):
         self.assert_status(path, 'PART', 1)
 
 
+    def content_file(self, lines=None, final='\n'):
+        self.content_lines = lines if lines is not None else [f'unique source row {i}: payload-{i}' for i in range(1, 7)]
+        self.content_path = os.path.join(self.tmp.name, 'Content.md')
+        with open(self.content_path, 'w', encoding='utf-8', newline='') as fh:
+            fh.write('\n'.join(self.content_lines) + final)
+        return self.content_path
+
+    def content_result(self, text, exit_code=0):
+        return json.dumps({'chunk_id': 'fixture', 'wall_time_seconds': 0.1, 'exit_code': exit_code,
+                           'original_token_count': 100, 'output': text}, ensure_ascii=False)
+
+    def content_records(self, texts=None, command='python3 reader.py', exit_code=0):
+        if texts is None:
+            texts = ['\n'.join(self.content_lines) + '\n']
+        return [record for i, text in enumerate(texts) for record in (
+            codex_exec(command, call_id=f'content_{i}'),
+            codex_output(f'content_{i}', COMPLETE_HEADER, self.content_result(text, exit_code)))]
+
+    def check_content(self, status='READ', texts=None, interval='', command='python3 reader.py', records=None,
+                      exit_code=0):
+        self.write_journal(records if records is not None else self.content_records(texts, command, exit_code))
+        self.assert_status(self.content_path + interval, status, 0 if status == 'READ' else 1)
+
+    def test_content_python_reader_is_read(self):
+        self.content_file()
+        self.check_content()
+
+    def test_content_command_array_is_read(self):
+        self.content_file()
+        records = self.content_records()
+        records[0]['payload']['input'] = 'const cmds=["python3 reader.py"]; text(await tools.exec_command({cmd:cmds[0]}));'
+        self.check_content(records=records)
+
+    def test_content_command_loop_is_read(self):
+        self.content_file()
+        records = self.content_records()
+        records[0]['payload']['input'] = 'for (const cmd of ["python3 reader.py"]) {text(await tools.exec_command({cmd}));}'
+        self.check_content(records=records)
+
+    def test_content_sed_chunks_via_loop_variable(self):
+        self.content_file()
+        texts = ['\n'.join(self.content_lines[:3]), '\n'.join(self.content_lines[3:])]
+        records = self.content_records(texts)
+        for record in records[::2]:
+            record['payload']['input'] = 'for (const path of paths) {const cmd=`sed -n "${a},${b}p" ${path}`; text(await tools.exec_command({cmd}));}'
+        self.check_content(records=records)
+
+    def test_content_nl_numbered_lines_are_read(self):
+        self.content_file()
+        self.check_content(texts=['\n'.join(f'{i:6}\t{s}' for i, s in enumerate(self.content_lines, 1))])
+
+    def test_content_cat_n_numbered_lines_are_read(self):
+        self.content_file()
+        self.check_content(texts=['\n'.join(f'     {i}\t{s}' for i, s in enumerate(self.content_lines, 1))])
+
+    def test_content_crlf_is_read(self):
+        self.content_file([f'row {i}\r' for i in range(6)])
+        self.check_content(texts=['\r\n'.join(f'row {i}' for i in range(6)) + '\r\n'])
+
+    def test_content_no_final_newline_is_read(self):
+        self.content_file(final='')
+        self.check_content(texts=['\n'.join(self.content_lines)])
+
+    def test_content_final_lf_adds_no_line(self):
+        self.content_file()
+        self.check_content()
+
+    def test_content_nonzero_command_exit_still_shows_text(self):
+        self.content_file()
+        self.check_content(exit_code=1)
+
+    def test_content_outer_warning_excludes_output(self):
+        self.content_file()
+        records = self.content_records()
+        records[1]['payload']['output'][0]['text'] = TRUNCATION_WARNING + COMPLETE_HEADER
+        self.check_content('MISS', records=records)
+
+    def test_content_inner_warning_excludes_output(self):
+        self.content_file()
+        self.check_content('MISS', texts=[TRUNCATION_WARNING + '\n'.join(self.content_lines)])
+
+    def test_content_bytes_omitted_excludes_output(self):
+        self.content_file()
+        self.check_content('MISS', texts=['... 141077 bytes omitted ...\n' + '\n'.join(self.content_lines)])
+
+    def test_content_tokens_truncated_excludes_output(self):
+        self.content_file()
+        self.check_content('MISS', texts=['…95 tokens truncated…\n' + '\n'.join(self.content_lines)])
+
+    def test_legacy_cat_bytes_omitted_is_not_read(self):
+        self.content_file()
+        self.check_content('PART', texts=['... 141077 bytes omitted ...\n' + '\n'.join(self.content_lines)],
+                           command=f'cat {self.content_path}')
+
+    def test_legacy_cat_tokens_truncated_is_not_read(self):
+        self.content_file()
+        self.check_content('PART', texts=['…95 tokens truncated…\n' + '\n'.join(self.content_lines)],
+                           command=f'cat {self.content_path}')
+
+    def test_legacy_sed_tokens_truncated_is_not_read(self):
+        self.content_file()
+        self.check_content('PART', texts=['…95 tokens truncated…\n' + '\n'.join(self.content_lines)],
+                           command=f"sed -n '1,6p' {self.content_path}")
+
+    def test_content_missing_middle_is_part(self):
+        self.content_file()
+        self.check_content('PART', texts=['\n'.join(self.content_lines[:2] + self.content_lines[3:])])
+
+    def test_content_other_file_isolated_lines_are_miss(self):
+        self.content_file()
+        other = os.path.join(self.tmp.name, 'Other.md')
+        with open(other, 'w', encoding='utf-8') as fh:
+            fh.write('\n'.join(self.content_lines[::2]))
+        self.check_content('MISS', texts=['\n'.join(self.content_lines[::2])])
+
+    def test_content_before_last_compaction_is_miss(self):
+        self.content_file()
+        self.check_content('MISS', records=self.content_records() + [CODEX_COMPACTION])
+
+    def test_content_blocks_do_not_cross_compaction(self):
+        self.content_file()
+        records = self.content_records(['\n'.join(self.content_lines[:3]), '\n'.join(self.content_lines[3:])])
+        records.insert(2, CODEX_COMPACTION)
+        self.check_content('PART', records=records)
+
+    def test_content_scattered_lines_shorter_than_k_are_miss(self):
+        self.content_file()
+        self.check_content('MISS', texts=['\nforeign row\n'.join(self.content_lines)])
+
+    def test_content_short_outputs_are_not_concatenated(self):
+        self.content_file()
+        self.check_content('MISS', texts=['\n'.join(self.content_lines[i:i + 2]) for i in (0, 2, 4)])
+
+    def test_content_sibling_results_are_not_concatenated(self):
+        self.content_file()
+        results = [self.content_result('\n'.join(self.content_lines[i:i + 2])) for i in (0, 2, 4)]
+        self.check_content('MISS', records=[codex_exec('python3 reader.py', 'one'), codex_output('one', *results)])
+
+    def test_content_text_blocks_are_not_concatenated(self):
+        self.content_file()
+        texts = ['\n'.join(self.content_lines[i:i + 2]) for i in (0, 2, 4)]
+        self.check_content('MISS', records=[codex_exec('python3 reader.py', 'one'), codex_output('one', *texts)])
+
+    def test_content_message_is_not_output(self):
+        self.content_file()
+        self.check_content('MISS', records=[{'type': 'response_item', 'payload': {
+            'type': 'message', 'content': [{'type': 'output_text', 'text': '\n'.join(self.content_lines)}]}}])
+
+    def test_content_call_input_is_not_output(self):
+        self.content_file()
+        self.check_content('MISS', records=[codex_exec('\n'.join(self.content_lines), 'one')])
+
+    def test_content_event_message_is_not_output(self):
+        self.content_file()
+        self.check_content('MISS', records=[{'type': 'event_msg', 'payload': {
+            'type': 'item_completed', 'output': '\n'.join(self.content_lines)}}])
+
+    def test_content_unrelated_tool_output_is_ignored(self):
+        self.content_file()
+        records = self.content_records()
+        records[0]['payload']['name'] = 'unrelated'
+        self.check_content('MISS', records=records)
+
+    def test_content_fulfilled_result_wrapper(self):
+        self.content_file()
+        records = self.content_records()
+        value = json.loads(records[1]['payload']['output'][1]['text'])
+        records[1]['payload']['output'][1]['text'] = json.dumps({'i': 2, 'result': {'status': 'fulfilled', 'value': value}})
+        self.check_content(records=records)
+
+    def test_content_does_not_decode_printed_json_as_tool_result(self):
+        self.content_file()
+        printed = self.content_result('\n'.join(self.content_lines))
+        self.check_content('MISS', texts=[printed])
+
+    def test_content_comparison_is_case_sensitive(self):
+        self.content_file()
+        lines = self.content_lines.copy()
+        lines[2] = lines[2].upper()
+        self.check_content('PART', texts=['\n'.join(lines)])
+
+    def test_content_space_number_prefix_is_not_removed(self):
+        self.content_file()
+        self.check_content('MISS', texts=['\n'.join(f'{i} {s}' for i, s in enumerate(self.content_lines, 1))])
+
+    def test_content_colon_number_prefix_is_not_removed(self):
+        self.content_file()
+        self.check_content('MISS', texts=['\n'.join(f'{i}:{s}' for i, s in enumerate(self.content_lines, 1))])
+
+    def test_content_source_number_prefix_via_cat(self):
+        self.content_file(['1\tfoo', '2\tbar', '3\tbaz'])
+        self.check_content(command='cat "$path"')
+
+    def test_content_source_number_prefix_via_nl(self):
+        self.content_file(['1\tfoo', '2\tbar', '3\tbaz'])
+        self.check_content(texts=['\n'.join(f'{i}\t{s}' for i, s in enumerate(self.content_lines, 1))])
+
+    def test_content_middle_line_checks_both_variants(self):
+        self.content_file()
+        lines = self.content_lines.copy()
+        lines[1] = '   2\t' + lines[1]
+        self.check_content(texts=['\n'.join(lines)])
+
+    def test_content_first_edge_checks_both_variants(self):
+        self.content_file()
+        lines = self.content_lines.copy()
+        lines[0] = '   1\t' + lines[0]
+        self.check_content(texts=['\n'.join(lines)])
+
+    def test_content_last_edge_checks_both_variants(self):
+        self.content_file()
+        lines = self.content_lines.copy()
+        lines[-1] = '   6\t' + lines[-1]
+        self.check_content(texts=['\n'.join(lines)])
+
+    def test_content_one_line_file_requires_exact_match(self):
+        self.content_file(['single unique line'])
+        self.check_content()
+
+    def test_content_one_line_suffix_is_miss(self):
+        self.content_file(['single unique line'])
+        self.check_content('MISS', texts=['unique line'])
+
+    def test_content_one_line_prefix_is_miss(self):
+        self.content_file(['single unique line'])
+        self.check_content('MISS', texts=['single unique'])
+
+    def test_content_two_line_file_full_output_is_read(self):
+        self.content_file(['first unique line', 'second different line'])
+        self.check_content()
+
+    def test_content_two_line_file_partial_edges_are_miss(self):
+        self.content_file(['first unique line', 'second different line'])
+        self.check_content('MISS', texts=['unique line\nsecond different'])
+
+    def test_content_repeated_lines_check_all_alignments(self):
+        self.content_file(['repeat'] * 6)
+        self.check_content(texts=['repeat\nrepeat\nrepeat'])
+
+    def test_content_empty_line_requires_exact_block(self):
+        self.content_file(['a', 'b', 'c', '', 'd', 'e', 'f'])
+        self.check_content()
+
+    def test_content_empty_line_not_covered_by_zero_length_edges(self):
+        self.content_file(['a', 'b', 'c', '', 'd', 'e', 'f'])
+        self.check_content('PART', texts=['a\nb\nc\nd\ne\nf'])
+
+    def test_content_empty_file_is_not_vacuously_read(self):
+        self.content_file([], final='')
+        self.check_content('MISS', texts=[''])
+
+    def test_legacy_cat_empty_file_keeps_status(self):
+        self.content_file([], final='')
+        self.check_content(texts=[''], command=f'cat {self.content_path}')
+
+    def test_content_requested_read_range_is_read(self):
+        self.content_file()
+        self.check_content(texts=['\n'.join(self.content_lines[:3])], interval=':1-3')
+
+    def test_content_requested_unread_range_is_miss(self):
+        self.content_file()
+        self.check_content('MISS', texts=['\n'.join(self.content_lines[:3])], interval=':4-6')
+
+    def test_content_range_length_does_not_lower_k(self):
+        self.content_file()
+        self.check_content('MISS', texts=[self.content_lines[2]], interval=':3-3')
+
+    def test_content_range_can_use_context_outside_range(self):
+        self.content_file()
+        self.check_content(texts=['\n'.join(self.content_lines[1:4])], interval=':3-3')
+
+    def test_legacy_cat_covers_requested_range(self):
+        self.content_file()
+        self.check_content(texts=['legacy'], command=f'cat {self.content_path}', interval=':2-4')
+
+    def test_legacy_sed_covers_requested_range(self):
+        self.content_file()
+        self.check_content(texts=['legacy'], command=f"sed -n '2,4p' {self.content_path}", interval=':2-4')
+
+    def test_range_mention_adds_no_coverage(self):
+        self.content_file()
+        self.check_content('MISS', texts=['legacy'], command=f'echo {self.content_path}', interval=':2-4')
+
+    def test_missing_source_range_is_miss(self):
+        self.content_file()
+        os.unlink(self.content_path)
+        self.check_content('MISS', texts=['legacy'], interval=':1-3')
+
+    def test_legacy_sed_and_content_cover_file(self):
+        self.content_file()
+        records = [codex_exec(f"sed -n '1,3p' {self.content_path}", 'legacy'), codex_output('legacy', 'text')]
+        records += self.content_records(['\n'.join(self.content_lines[3:])])
+        self.check_content(records=records)
+
+    def test_content_zero_range_start_returns_two(self):
+        self.content_file()
+        self.write_journal(self.content_records())
+        self.assertEqual(self.run_cli(self.content_path + ':0-3').returncode, 2)
+
+    def test_content_reversed_range_returns_two(self):
+        self.content_file()
+        self.write_journal(self.content_records())
+        self.assertEqual(self.run_cli(self.content_path + ':4-2').returncode, 2)
+
+    def test_content_range_past_eof_returns_two(self):
+        self.content_file()
+        self.write_journal(self.content_records())
+        self.assertEqual(self.run_cli(self.content_path + ':1-7').returncode, 2)
+
+    def test_content_ranges_of_same_file_are_independent(self):
+        self.content_file()
+        self.write_journal(self.content_records(['\n'.join(self.content_lines[:3])]))
+        result = self.run_cli(self.content_path + ':1-3', self.content_path + ':4-6')
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), [f'READ {self.content_path}:1-3', f'MISS {self.content_path}:4-6'])
+
+    def split_fixture(self, unicode=False):
+        lines = ['first long context row AAA', 'second long context row BBB',
+                 'начало😀середина🦊окончание' if unicode else 'START-abcdefghij-END',
+                 'fourth long context row DDD', 'fifth long context row EEE']
+        self.content_file(lines)
+        cut = len('начало😀'.encode()) if unicode else 10
+        data = lines[2].encode()
+        self.split_prefix = data[:cut].decode()
+        self.split_suffix = data[cut:].decode()
+        size = len(('\n'.join(lines[:2]) + '\n').encode()) + cut
+        total = len(('\n'.join(lines) + '\n').encode())
+        self.split_headers = [f'{self.content_path} lines 1-5, bytes 0:{size}, chunk 1/2',
+                              f'{self.content_path} lines 1-5, bytes {size}:{total}, chunk 2/2']
+        return self.split_outputs(self.split_prefix, self.split_suffix)
+
+    def split_outputs(self, prefix, suffix):
+        lines = self.content_lines
+        return ['\n'.join([self.split_headers[0], *lines[:2], prefix]),
+                '\n'.join([self.split_headers[1], suffix, *lines[3:]])]
+
+    def test_content_python_byte_split_is_read(self):
+        texts = self.split_fixture()
+        self.check_content(texts=texts)
+
+    def test_content_split_line_range_is_read(self):
+        texts = self.split_fixture()
+        self.check_content(texts=texts, interval=':3-3')
+
+    def test_content_split_edges_may_overlap(self):
+        self.split_fixture()
+        self.check_content(texts=self.split_outputs(self.content_lines[2][:12], self.content_lines[2][8:]), interval=':3-3')
+
+    def test_content_middle_fragment_cannot_cover_line(self):
+        self.split_fixture()
+        middle = self.content_lines[2][3:-3]
+        self.check_content('MISS', texts=self.split_outputs(middle, middle), interval=':3-3')
+
+    def test_content_suffix_without_prefix_is_miss(self):
+        texts = self.split_fixture()
+        self.check_content('MISS', texts=texts[1:], interval=':3-3')
+
+    def test_content_suffix_neighbors_must_be_consecutive(self):
+        texts = self.split_fixture()
+        texts[1] = texts[1].replace(self.content_lines[3], self.content_lines[0])
+        self.check_content('MISS', texts=texts, interval=':3-3')
+
+    def test_content_first_fragment_must_be_true_suffix(self):
+        self.split_fixture()
+        self.check_content('MISS', texts=self.split_outputs(self.split_prefix, 'false suffix'), interval=':3-3')
+
+    def test_content_split_edges_with_gap_are_miss(self):
+        self.split_fixture()
+        self.check_content('MISS', texts=self.split_outputs(self.split_prefix[:-1], self.split_suffix), interval=':3-3')
+
+    def test_content_duplicate_prefixes_do_not_add_lengths(self):
+        self.split_fixture()
+        second = self.content_lines[2][:12]
+        texts = self.split_outputs(self.split_prefix, self.split_suffix)
+        texts[1] = '\n'.join([self.split_headers[1], *self.content_lines[:2], second])
+        self.check_content('MISS', texts=texts, interval=':3-3')
+
+    def test_content_duplicate_suffixes_do_not_add_lengths(self):
+        self.split_fixture()
+        first = self.content_lines[2][8:]
+        texts = self.split_outputs(self.split_prefix, self.split_suffix)
+        texts[0] = '\n'.join([self.split_headers[0], first, *self.content_lines[3:]])
+        self.check_content('MISS', texts=texts, interval=':3-3')
+
+    def test_content_truncated_prefix_cannot_complete_suffix(self):
+        texts = self.split_fixture()
+        texts[0] = TRUNCATION_WARNING + texts[0]
+        self.check_content('MISS', texts=texts, interval=':3-3')
+
+    def test_content_split_edges_reset_at_compaction(self):
+        texts = self.split_fixture()
+        records = self.content_records(texts)
+        records.insert(2, CODEX_COMPACTION)
+        self.check_content('MISS', records=records, interval=':3-3')
+
+    def test_content_split_edge_requires_full_block_length(self):
+        texts = self.split_fixture()
+        texts[0] = texts[0].replace(self.content_lines[0] + '\n', '')
+        self.check_content('MISS', texts=texts, interval=':3-3')
+
+    def test_content_split_edges_use_utf8_byte_lengths(self):
+        texts = self.split_fixture(unicode=True)
+        self.check_content(texts=texts)
+
+    def unicode_fixture(self, inside=False):
+        self.content_file(['left one', 'left two', 'left three', 'начало😀окончание',
+                           'right five', 'right six', 'right seven'])
+        data = self.content_lines[3].encode()
+        cut = len('начало'.encode()) + (1 if inside else 0)
+        return ['header chunk 1/2\n' + '\n'.join([*self.content_lines[:3], data[:cut].decode(errors='replace')]),
+                'header chunk 2/2\n' + '\n'.join([data[cut:].decode(errors='replace'), *self.content_lines[4:]])]
+
+    def test_content_unicode_boundary_split_is_read(self):
+        texts = self.unicode_fixture()
+        self.check_content(texts=texts)
+
+    def test_content_split_inside_utf8_character_is_part(self):
+        texts = self.unicode_fixture(inside=True)
+        self.check_content('PART', texts=texts)
+
+
+    def test_windows_drive_path_with_hyphen_is_not_a_range(self):
+        path = r'C:\Work\some-rules.md'
+        self.write_journal([codex_exec(f'cat "{path}"')])
+        self.assert_status(path, 'READ', 0)
+
+    def test_content_malformed_range_returns_two(self):
+        self.content_file()
+        self.write_journal(self.content_records())
+        self.assertEqual(self.run_cli(self.content_path + ':1-x').returncode, 2)
+
+    def test_content_plain_string_output_is_read(self):
+        self.content_file()
+        record = codex_output('plain')
+        record['payload']['output'] = '\n'.join(self.content_lines)
+        self.check_content(records=[codex_exec('python3 reader.py', 'plain'), record])
+
+    def test_content_untruncated_sibling_survives_inner_truncation(self):
+        self.content_file()
+        good = self.content_result('\n'.join(self.content_lines))
+        cut = self.content_result('…95 tokens truncated…')
+        self.check_content(records=[codex_exec('python3 reader.py', 'siblings'),
+                                    codex_output('siblings', cut, good)])
+
+    def test_legacy_cat_truncated_sibling_invalidates_whole_call(self):
+        self.content_file()
+        cut = self.content_result('…95 tokens truncated…')
+        plain = self.content_result('legacy')
+        self.check_content('PART', records=[codex_exec(f'cat {self.content_path}', 'siblings'),
+                                            codex_output('siblings', cut, plain)])
+
+    def test_missing_source_range_can_use_legacy_sed(self):
+        self.content_file()
+        os.unlink(self.content_path)
+        self.check_content(texts=['legacy'], command=f"sed -n '1,3p' {self.content_path}", interval=':1-3')
+
+    def test_range_partial_coverage_is_part(self):
+        self.content_file()
+        self.check_content('PART', texts=['\n'.join(self.content_lines[:3])], interval=':2-4')
+
+
+    def test_legacy_sed_keeps_byte_line_count_for_non_utf8_source(self):
+        path = os.path.join(self.tmp.name, 'bytes.md')
+        with open(path, 'wb') as fh:
+            fh.write(b'first\n\xff\nlast\n')
+        self.write_journal(self.sed_journal(path, '1,3p'))
+        self.assert_status(path, 'READ', 0)
+
+    def test_range_past_non_utf8_source_eof_returns_two(self):
+        path = os.path.join(self.tmp.name, 'bytes.md')
+        with open(path, 'wb') as fh:
+            fh.write(b'first\n\xff\nlast\n')
+        self.write_journal(self.sed_journal(path, '1,3p'))
+        self.assertEqual(self.run_cli(path + ':1-4').returncode, 2)
+
+
 if __name__ == '__main__':
     unittest.main()
